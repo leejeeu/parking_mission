@@ -22,6 +22,7 @@
   <exec_depend>nav2_map_server</exec_depend>
   <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_smac_planner</exec_depend>
   <exec_depend>xycar_lidar</exec_depend>
   <exec_depend>xycar_imu</exec_depend>
 

@@ -151,7 +151,11 @@ controller_server:
           "PathDist",
           "GoalDist",
         ]
-      BaseObstacle.scale: 0.02
+      # [2026-08-18] 0.02 -> 0.5로 상향. 원래 값은 표준 turtlebot3 템플릿에서 그대로 가져온
+      # 것인데, PathAlign(32)/PathDist(32) 등 경로추종 비용에 비해 장애물 회피 비중이 너무
+      # 낮아서 실행 중(컨트롤러 단계)엔 벽 근접을 거의 무시하고 경로를 고수하는 쪽으로
+      # 흘렀을 수 있다 — 팽창영역(플래너 단계)만으로는 실행 중 오차/드리프트를 못 잡아준다.
+      BaseObstacle.scale: 0.5
       PathAlign.scale: 32.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
@@ -180,8 +184,12 @@ local_costmap:
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.3
+        # [2026-08-18] 기존 inflation_radius(0.3)가 robot_radius(0.36)보다 작아서 팽창 비용
+        # 구배가 차체 반경 안쪽에서 끝나버리는 버그였다 — 사실상 "벽에 거의 닿아야 비용이
+        # 오른다"는 뜻이라 벽에 붙는 경로/충돌을 못 막았다. inflation_radius는 반드시
+        # robot_radius보다 커야 실제 완충구역이 생긴다(0.36 + 약 0.1m 여유 = 0.45).
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.45
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -235,8 +243,9 @@ global_costmap:
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.3
+        # local_costmap과 동일한 이유로 robot_radius(0.36)보다 크게 수정.
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.45
       always_send_full_costmap: true
 
 map_server:
@@ -256,11 +265,44 @@ planner_server:
     use_sim_time: false
     expected_planner_frequency: 5.0
     planner_plugins: ["GridBased"]
+    # [2026-08-18] NavfnPlanner(격자 기반 순수 A*, 차량 회전반경을 모른다) -> SmacPlannerHybrid로
+    # 교체. "벽에 부딪히고 멈추는" 문제의 한 원인이 여기 있었다 — 격자 A*가 짠 경로는 코너에서
+    # 급하게 꺾이는 지점이 생길 수 있는데, 이 차는 Ackermann 조향이라 실제 추종 제어기가 그
+    # 꺾임을 못 따라가고 코너를 잘라먹으며 벽을 스칠 수 있다. SmacPlannerHybrid는 최소 회전반경
+    # 제약을 넣어 "차가 실제로 따라갈 수 있는" 곡선 경로만 생성한다(=사용자가 말한 Modified A*).
     GridBased:
-      plugin: "nav2_navfn_planner::NavfnPlanner"
-      tolerance: 0.5
-      use_astar: true
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      downsample_costmap: false
+      downsampling_factor: 1
+      tolerance: 0.25
       allow_unknown: false   # 주차장은 맵 밖 미탐사 영역으로 계획하지 않도록 false 권장
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 5.0
+      # REEDS_SHEPP: 전진뿐 아니라 후진도 허용(전진만 되는 DUBIN 대신) — 주차는 후진 진입이
+      # 필요한 경우가 많다.
+      motion_model_for_search: "REEDS_SHEPP"
+      angle_quantization_bins: 72
+      analytic_expansion_ratio: 3.5
+      analytic_expansion_max_length: 3.0
+      # 실측 축거(WHEELBASE_M=0.335m) 기준, 최대조향각을 UMK planner/hybrid_astar.py와 동일한
+      # 30도(실측 아닌 설계값)로 가정해 산출: r = wheelbase / tan(30°) ≈ 0.58m. 이보다 타이트한
+      # 회전은 실제로 못 도니 약간의 여유를 더해 0.6m로 설정(실차에서 좁은 코너 진입 실패하면
+      # 낮추고, 진동/오버슈트 있으면 올릴 것).
+      minimum_turning_radius: 0.6
+      reverse_penalty: 2.0
+      change_penalty: 0.0
+      non_straight_penalty: 1.2
+      cost_penalty: 2.0
+      retrospective_penalty: 0.025
+      lookup_table_size: 20.0
+      cache_obstacle_heuristic: false
+      smooth_path: true
+      smoother:
+        max_iterations: 1000
+        w_smooth: 0.3
+        w_data: 0.2
+        tolerance: 1.0e-10
 
 behavior_server:
   ros__parameters:
