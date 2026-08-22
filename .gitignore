@@ -1,3 +1,8 @@
+# ROS2 colcon build outputs
+ROS2_ws/build/
+ROS2_ws/install/
+ROS2_ws/log/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

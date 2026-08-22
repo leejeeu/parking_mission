@@ -39,7 +39,12 @@ from geometry_msgs.msg import TransformStamped
 from ..vehicle_spec import WHEELBASE_M, VESC_SPEED_TO_ERPM_GAIN, VESC_STALE_SEC, IMU_STALE_SEC
 from .pose_estimator import EncoderPoseEstimator
 
-ODOM_PUBLISH_PERIOD_S = 0.05   # 20Hz
+# [2026-08-22] 20Hz -> 100Hz. K턴이 1.2초마다 전진/후진 부호를 뒤집는데, 20Hz(0.05s)
+# 오일러 적분은 콜백이 조금만 밀려도 "그 순간의 속도"를 훨씬 긴 dt에 곱하게 돼 이산화
+# 오차가 커진다 — 실측 확인: K턴 도중 /odom이 /gazebo/odom(ground truth) 대비 3~6m까지
+# 벌어짐(IMU 헤딩은 실측 결과 ground truth와 오차 0 확인됨 — 적분 샘플링 쪽이 원인).
+# 주기를 5배 높여 부호전환 사이 샘플 수를 늘려 이산화 오차를 줄인다.
+ODOM_PUBLISH_PERIOD_S = 0.01   # 100Hz
 
 
 def yaw_to_quaternion(yaw: float):
@@ -60,7 +65,7 @@ class OdomPublisher(Node):
         self._vesc_t = None
         self.imu_yaw = 0.0
         self._imu_t = None
-        self._last_update_t = None
+        self._last_update_ns = None
         self._prev_yaw_for_twist = None
 
         self.pose_estimator = EncoderPoseEstimator(wheelbase_m=WHEELBASE_M)
@@ -98,14 +103,22 @@ class OdomPublisher(Node):
         return self._imu_t is not None and (time.time() - self._imu_t) < IMU_STALE_SEC
 
     def _update_and_publish(self):
+        # [2026-08-22] dt를 time.time()(벽시계)으로 재던 것을 self.get_clock().now()
+        # (use_sim_time을 따르는 ROS 클럭)로 교체 — v_mps(/vesc_speed_erpm)는 Gazebo
+        # 시뮬레이션 시간 기준 속도인데, 벽시계 dt로 적분하면 Gazebo의 real-time factor가
+        # 1.0이 아닐 때(이 환경처럼 CPU 부하가 커서 물리엔진이 실시간보다 느리게 도는
+        # 경우) "실제 흐른 시뮬레이션 시간"보다 훨씬 큰 dt로 속도를 적분해 위치가 실제보다
+        # 훨씬 많이 튀어나간다. 실측 확인: K턴 도중 /odom이 /gazebo/odom(ground truth)
+        # 대비 수 미터(6m 안팎)까지 발산 — local_costmap이 이 발산한 odom을 기준으로
+        # 롤링윈도우를 잡다 보니 "Sensor origin ... out of map bounds" 경고가 반복되고,
+        # AMCL 모션모델에도 잘못된 델타가 들어가 도킹 중 헤딩추정이 요동치는 것까지 이어졌다.
         now = self.get_clock().now()
-        now_sec = time.time()
 
-        if self._last_update_t is None:
-            self._last_update_t = now_sec
+        if self._last_update_ns is None:
+            self._last_update_ns = now.nanoseconds
             return
-        dt = now_sec - self._last_update_t
-        self._last_update_t = now_sec
+        dt = (now.nanoseconds - self._last_update_ns) / 1e9
+        self._last_update_ns = now.nanoseconds
 
         # 센서가 죽어있으면 "조용히 마지막 값 유지"가 아니라 v=0으로 접어서 위치가
         # 계속 튀어나가지 않게 하되, 경고는 매번(throttle) 남긴다.

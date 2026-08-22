@@ -22,6 +22,9 @@ def generate_launch_description():
     autostart = LaunchConfiguration('autostart')
     parking_zone = LaunchConfiguration('parking_zone')
     set_initial_pose = LaunchConfiguration('set_initial_pose')
+    start_x = LaunchConfiguration('start_x')
+    start_y = LaunchConfiguration('start_y')
+    start_yaw = LaunchConfiguration('start_yaw')
     bringup_sensors = LaunchConfiguration('bringup_sensors')
     laser_frame_id = LaunchConfiguration('laser_frame_id')
     lidar_x = LaunchConfiguration('lidar_x')
@@ -51,6 +54,21 @@ def generate_launch_description():
     declare_set_initial_pose_arg = DeclareLaunchArgument(
         'set_initial_pose', default_value='true',
         description='시작 시 출발영역 pose를 /initialpose로 자동 발행할지 여부')
+
+    # [2026-08-20] 이전엔 이 launch가 start_x/y/yaw를 아예 안 받아서
+    # parking_navigator_node가 항상 자기 내부 기본값(1.8/0.9/3.14)만 썼다 — 시뮬레이션
+    # 쪽(parking_mission_sim.launch.py)에서 스폰 위치를 랜덤화해도 AMCL은 여전히
+    # "1.8, 0.9에 있다"고 잘못 믿게 되는 불일치가 있었다. 이제 명시적으로 받아서
+    # 아래 parking_navigator_node.parameters로 전달한다(기본값은 기존 고정 시작점과 동일).
+    declare_start_x_arg = DeclareLaunchArgument(
+        'start_x', default_value='1.8',
+        description='parking_navigator가 /initialpose로 발행할 시작 x(실제 스폰 위치와 일치해야 함)')
+    declare_start_y_arg = DeclareLaunchArgument(
+        'start_y', default_value='0.9',
+        description='parking_navigator가 /initialpose로 발행할 시작 y(실제 스폰 위치와 일치해야 함)')
+    declare_start_yaw_arg = DeclareLaunchArgument(
+        'start_yaw', default_value='3.14',
+        description='parking_navigator가 /initialpose로 발행할 시작 yaw(rad, 실제 스폰 위치와 일치해야 함)')
 
     declare_bringup_sensors_arg = DeclareLaunchArgument(
         'bringup_sensors', default_value='true',
@@ -147,6 +165,9 @@ def generate_launch_description():
                     'use_sim_time': use_sim_time,
                     'parking_zone': parking_zone,
                     'set_initial_pose': set_initial_pose,
+                    'start_x': start_x,
+                    'start_y': start_y,
+                    'start_yaw': start_yaw,
                 }],
             )
         ],
@@ -159,6 +180,9 @@ def generate_launch_description():
         declare_autostart_arg,
         declare_parking_zone_arg,
         declare_set_initial_pose_arg,
+        declare_start_x_arg,
+        declare_start_y_arg,
+        declare_start_yaw_arg,
         declare_bringup_sensors_arg,
         declare_laser_frame_id_arg,
         declare_lidar_x_arg,

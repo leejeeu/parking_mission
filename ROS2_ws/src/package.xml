@@ -23,8 +23,12 @@
   <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
   <exec_depend>nav2_smac_planner</exec_depend>
+  <exec_depend>nav2_regulated_pure_pursuit_controller</exec_depend>
   <exec_depend>xycar_lidar</exec_depend>
   <exec_depend>xycar_imu</exec_depend>
+
+  <!-- Gazebo 시뮬레이션(launch/parking_mission_sim.launch.py)에서만 필요 -->
+  <exec_depend>gazebo_ros</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -1,0 +1,329 @@
+<?xml version="1.0"?>
+<!--
+  xycar.urdf — Gazebo 시뮬레이션 전용 차량 모델. xacro 미설치 환경이라 매크로 없이
+  순수 URDF로 작성함(ros-humble-xacro 패키지가 이 워크스페이스에 없음).
+
+  치수는 parking_mission/vehicle_spec.py의 실측값을 그대로 사용:
+  WHEELBASE_M=0.335, VEHICLE_LENGTH_M=0.64, VEHICLE_WIDTH_M=0.31, ANGLE_MAX_DEG=80.
+  vehicle_spec.py가 바뀌면(재실측 등) 이 파일의 숫자도 같이 갱신할 것.
+
+  base_link 원점 = 지면에 투영한 차량 중심(z=0이 바닥). 휠 축 높이=0.03m(WHEEL_RADIUS).
+
+  라이다/IMU 장착 오프셋: x,y는 launch/parking_mission.launch.py의 lidar_x/lidar_y
+  기본값(0,0, "★실측 필요★" 플레이스홀더)과 일관되게 0으로 둔다. z는 실차 TF에서는
+  항상 0으로 고정(그 launch 파일의 static_transform_publisher가 z 인자를 0.0으로 고정)이라
+  실측 대상이 아니지만, 이 URDF는 시뮬 물리상 라이다가 바닥에 파묻히면 안 되므로
+  z만 예외적으로 차체 위(0.15m)에 둔다 — 실차 TF와 무관한 순수 시뮬 필요성.
+-->
+<robot name="xycar">
+
+  <material name="body_grey">
+    <color rgba="0.2 0.2 0.2 1.0"/>
+  </material>
+  <material name="wheel_black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+
+  <!-- ============ base_link (차체) ============ -->
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0.13" rpy="0 0 0"/>
+      <mass value="3.0"/>
+      <inertia ixx="0.034" ixy="0" ixz="0" iyy="0.1124" iyz="0" izz="0.1264"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.13" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.64 0.31 0.20"/>
+      </geometry>
+      <material name="body_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.13" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.64 0.31 0.20"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ============ 앞바퀴(조향) ============ -->
+  <!-- 조향 너클(steer knuckle) 더미 링크 — base_link<->wheel 사이에서 조향 회전만 담당 -->
+  <link name="front_left_steer_link">
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="0.0000033" ixy="0" ixz="0" iyy="0.0000033" iyz="0" izz="0.0000033"/>
+    </inertial>
+  </link>
+  <joint name="front_left_steer_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_left_steer_link"/>
+    <origin xyz="0.1675 0.13 0.03" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5" upper="1.5" effort="10" velocity="5"/>
+  </joint>
+
+  <link name="front_left_wheel">
+    <inertial>
+      <mass value="0.15"/>
+      <inertia ixx="0.0000388" ixy="0" ixz="0" iyy="0.0000388" iyz="0" izz="0.0000675"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="front_left_wheel_joint" type="continuous">
+    <parent link="front_left_steer_link"/>
+    <child link="front_left_wheel"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- [2026-08-20] ackermann_drive의 linear_velocity_pid_gain이 이 관절에 토크를
+         명령하는데, continuous 관절이라 effort/velocity 상한이 없어 PID가 순간적으로
+         무한대에 가까운 토크를 요구할 수 있었다 — 바퀴 관성이 극도로 작아서(izz
+         0.0000675kg·m², 아래 주석 참고) 이게 /gazebo/odom NaN 발산의 유력한 원인으로
+         보여 물리적으로 타당한 상한(3kg 차량 기준 대략치)을 추가한다. 지면 접촉
+         강성(kp/kd/min_depth)은 위 "타이어 마찰" 주석의 경고대로 손대지 않음 —
+         이건 별개의 관절 구동 상한이다. -->
+    <limit effort="1.0" velocity="80"/>
+  </joint>
+
+  <link name="front_right_steer_link">
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="0.0000033" ixy="0" ixz="0" iyy="0.0000033" iyz="0" izz="0.0000033"/>
+    </inertial>
+  </link>
+  <joint name="front_right_steer_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_right_steer_link"/>
+    <origin xyz="0.1675 -0.13 0.03" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5" upper="1.5" effort="10" velocity="5"/>
+  </joint>
+
+  <link name="front_right_wheel">
+    <inertial>
+      <mass value="0.15"/>
+      <inertia ixx="0.0000388" ixy="0" ixz="0" iyy="0.0000388" iyz="0" izz="0.0000675"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="front_right_wheel_joint" type="continuous">
+    <parent link="front_right_steer_link"/>
+    <child link="front_right_wheel"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- front_left_wheel_joint와 동일 이유 (위 주석 참고) -->
+    <limit effort="1.0" velocity="80"/>
+  </joint>
+
+  <!-- ============ 뒷바퀴(구동만, 조향 없음) ============ -->
+  <link name="rear_left_wheel">
+    <inertial>
+      <mass value="0.15"/>
+      <inertia ixx="0.0000388" ixy="0" ixz="0" iyy="0.0000388" iyz="0" izz="0.0000675"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rear_left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rear_left_wheel"/>
+    <origin xyz="-0.1675 0.13 0.03" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- front_left_wheel_joint와 동일 이유 (위 주석 참고) -->
+    <limit effort="1.0" velocity="80"/>
+  </joint>
+
+  <link name="rear_right_wheel">
+    <inertial>
+      <mass value="0.15"/>
+      <inertia ixx="0.0000388" ixy="0" ixz="0" iyy="0.0000388" iyz="0" izz="0.0000675"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+      <material name="wheel_black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.02"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="rear_right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="rear_right_wheel"/>
+    <origin xyz="-0.1675 -0.13 0.03" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- front_left_wheel_joint와 동일 이유 (위 주석 참고) -->
+    <limit effort="1.0" velocity="80"/>
+  </joint>
+
+  <!-- ============ 타이어 마찰 ============ -->
+  <!-- kp/kd/maxVel/minDepth(접촉 강성) 오버라이드는 여기 넣지 않는다 — 한 번 넣어봤다가
+       바퀴는 항상 지면과 붙어있는 링크라, 그 접촉의 강성을 낮추면 오히려 지면 접촉
+       자체가 불안정해져서 주행 시작하자마자 /gazebo/odom이 NaN이 되는 회귀를 실측
+       확인함(2026-08-19). 벽 충돌 완화(worlds/parking_map.world 쪽 min_depth/kp/kd)는
+       벽 쪽에만 넣어서 지면 접촉(ODE 기본값, 안정적으로 검증됨)은 안 건드린다. 여기는
+       순수 마찰계수만 지정.-->
+  <gazebo reference="front_left_wheel">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+  <gazebo reference="front_right_wheel">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+  <gazebo reference="rear_left_wheel">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+  <gazebo reference="rear_right_wheel">
+    <mu1>1.0</mu1>
+    <mu2>1.0</mu2>
+  </gazebo>
+
+  <!-- ============ 센서 (base_link에 직접 부착 — 별도 링크 없이 gazebo reference로) ============ -->
+  <gazebo reference="base_link">
+    <sensor name="lidar" type="ray">
+      <pose>0 0 0.15 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <visualize>false</visualize>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>360</samples>
+            <resolution>1</resolution>
+            <min_angle>-3.14159</min_angle>
+            <max_angle>3.14159</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.15</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+      </ray>
+      <plugin name="lidar_plugin" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>laser</frame_name>
+      </plugin>
+    </sensor>
+
+    <sensor name="imu_sensor" type="imu">
+      <pose>0 0 0.13 0 0 0</pose>
+      <always_on>true</always_on>
+      <update_rate>50</update_rate>
+      <plugin name="imu_plugin" filename="libgazebo_ros_imu_sensor.so">
+        <ros>
+          <remapping>~/out:=imu</remapping>
+        </ros>
+        <initial_orientation_as_reference>false</initial_orientation_as_reference>
+      </plugin>
+    </sensor>
+
+    <!-- [2026-08-20] 초음파(sensor_msgs/Range) 근접 센서를 정밀 접근 안전장치로
+         추가했다가 완전히 제거함 — 범퍼 모서리 4개 → rclpy/rmw가 같은 메시지 타입을
+         한 노드에 2개 이상 구독하면 깨지는 걸 확인해 1개(전방)로 축소 → 그래도 그
+         예외가 한 번이라도 발생하면 parking_navigator.py 노드의 콜백 처리 전체가
+         멈춰버리는(프로세스는 안 죽지만 아무것도 진행 안 됨) 더 심각한 문제가
+         재현돼, 안전장치 하나 때문에 미션 전체가 죽는 게 더 위험하다고 판단해
+         걷어냈다. 자세한 경위는 parking_navigator.py 모듈 상단 주석 참고. 다시
+         시도한다면 이 환경의 rclpy/rmw 버전부터 점검할 것(애플리케이션 코드
+         문제가 아니라 최소 재현 스크립트로 격리 확인됨). -->
+  </gazebo>
+
+  <!-- ============ 구동/조향 플러그인 ============ -->
+  <!-- /cmd_vel, /odom은 각각 Nav2 controller_server와 odom_publisher.py가 이미 쓰고 있어서
+       충돌 회피를 위해 /gazebo/cmd_vel, /gazebo/odom으로 리매핑한다. 실제 xycar_motor <->
+       cmd_vel 변환은 parking_mission/sim/motor_bridge.py가 이 /gazebo/cmd_vel과
+       /gazebo/odom을 중개해서 담당(odom_publisher.py 등 실차 코드는 그대로 둔 채). -->
+  <gazebo>
+    <plugin name="ackermann_drive" filename="libgazebo_ros_ackermann_drive.so">
+      <ros>
+        <remapping>cmd_vel:=/gazebo/cmd_vel</remapping>
+        <remapping>odom:=/gazebo/odom</remapping>
+      </ros>
+
+      <update_rate>50.0</update_rate>
+
+      <front_left_joint>front_left_wheel_joint</front_left_joint>
+      <front_right_joint>front_right_wheel_joint</front_right_joint>
+      <rear_left_joint>rear_left_wheel_joint</rear_left_joint>
+      <rear_right_joint>rear_right_wheel_joint</rear_right_joint>
+      <left_steering_joint>front_left_steer_joint</left_steering_joint>
+      <right_steering_joint>front_right_steer_joint</right_steering_joint>
+      <steering_wheel_joint>front_left_steer_joint</steering_wheel_joint>
+
+      <!-- ANGLE_MAX_DEG=80도(vehicle_spec.py)와 동일 -->
+      <max_steer>1.396</max_steer>
+      <max_steering_angle>1.396</max_steering_angle>
+      <max_speed>2.0</max_speed>
+
+      <!-- 이 값들은 gazebo_plugins 데모 월드(gazebo_ros_ackermann_drive_demo.world)의
+           프리우스급(질량 1326kg, 바퀴 관성 ~0.33kg·m²) PID 게인을 그대로 복사했다가
+           실측으로 문제를 발견했다: 이 차는 전체 3kg, 바퀴 관성이 그것보다 4자리수 작아서
+           (~0.00007kg·m²) 데모 게인을 그대로 쓰면 첫 조향 명령에서 물리 시뮬레이션이
+           즉시 NaN으로 발산했다(2026-08-19, /gazebo/odom.twist가 NaN, 차량이 전혀 안
+           움직임). 바퀴 관성 비율(약 0.00007/0.33 ≈ 2e-4)로 데모 게인을 스케일링해
+           대략적인 값을 잡음 — 정밀 튜닝값은 아니고, 발산 없이 명령을 어느 정도
+           추종하는 수준의 근사치. -->
+      <left_steering_pid_gain>0.5 0 0.05</left_steering_pid_gain>
+      <left_steering_i_range>0 0</left_steering_i_range>
+      <right_steering_pid_gain>0.5 0 0.05</right_steering_pid_gain>
+      <right_steering_i_range>0 0</right_steering_i_range>
+      <linear_velocity_pid_gain>0.3 0 0.02</linear_velocity_pid_gain>
+      <linear_velocity_i_range>0 0</linear_velocity_i_range>
+
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>false</publish_odom_tf>
+      <publish_wheel_tf>false</publish_wheel_tf>
+      <publish_distance>false</publish_distance>
+      <publish_steerangle>false</publish_steerangle>
+
+      <odometry_frame>odom_gazebo</odometry_frame>
+      <robot_base_frame>base_link</robot_base_frame>
+    </plugin>
+  </gazebo>
+
+</robot>

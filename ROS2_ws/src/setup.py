@@ -15,6 +15,8 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'maps'), glob('maps/*')),
+        (os.path.join('share', package_name, 'urdf'), glob('urdf/*.urdf')),
+        (os.path.join('share', package_name, 'worlds'), glob('worlds/*.world')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -28,6 +30,7 @@ setup(
             'parking_navigator = parking_mission.parking_navigator:main',
             'odom_publisher = parking_mission.localization.odom_publisher:main',
             'cmd_vel_bridge = parking_mission.cmd_vel_bridge:main',
+            'sim_motor_bridge = parking_mission.sim.motor_bridge:main',
         ],
     },
 )

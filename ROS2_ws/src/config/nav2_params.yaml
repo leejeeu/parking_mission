@@ -69,22 +69,66 @@ bt_navigator:
     odom_topic: /odom
     bt_loop_duration: 10
     default_server_timeout: 20
-    default_nav_to_pose_bt_xml: ""
-    default_nav_through_poses_bt_xml: ""
+    # default_nav_to_pose_bt_xml/default_nav_through_poses_bt_xml을 빈 문자열로 명시하면
+    # bt_navigator가 실제로 "Empty Tree" 예외를 던지고 모든 목표를 즉시 실패시킨다
+    # (BehaviorTreeEngine: "Empty Tree. Exiting with failure.", 실측 확인 2026-08-19).
+    # nav2_bringup 공식 기본 params.yaml도 이 두 키를 아예 안 씀 — bt_navigator 자체의
+    # 내장 기본값(nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml 등)이
+    # 적용되도록 여기서도 키 자체를 생략한다.
+    # 원래 이 목록엔 nav2_navigate_to_pose_action_bt_node용 트리에 필요한 것들만 일부
+    # 담겨 있었는데, bt_navigator는 activate 시 navigate_to_pose "그리고"
+    # navigate_through_poses 기본 트리를 둘 다 로드하려고 시도한다 — through_poses
+    # 트리(navigate_through_poses_w_replanning_and_recovery.xml)가 쓰는
+    # RemovePassedGoals 등 여러 노드가 빠져 있어서 "Node not recognized"로 bt_navigator
+    # 전체 activate가 실패하고, 그 결과 모든 navigate_to_pose 목표가 거부되는 것을 실측
+    # 확인함(2026-08-19). nav2_bringup 공식 기본 params.yaml의 전체 목록으로 교체해
+    # 두 트리 모두 확실히 로드되게 한다.
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
       - nav2_follow_path_action_bt_node
       - nav2_spin_action_bt_node
       - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
       - nav2_clear_costmap_service_bt_node
       - nav2_is_stuck_condition_bt_node
       - nav2_goal_reached_condition_bt_node
       - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
       - nav2_reinitialize_global_localization_service_bt_node
       - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
       - nav2_recovery_node_bt_node
       - nav2_pipeline_sequence_bt_node
       - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
 
 controller_server:
   ros__parameters:
@@ -99,8 +143,13 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # 목표 근처에서 5cm/3도 정밀도로 미세 정렬하는 마지막 단계는 당연히 0.5m씩
+      # 크게 움직이지 않는데, 원래 값(0.5m/10초)은 그 상황을 "진행 없음"으로 오판해
+      # 시간초과로 abort시켰다(실측 확인, 2026-08-19 — 경로 끝(거리 0)까지는 정상 주행,
+      # 그 이후 미세정렬 중 46초 만에 실패). 정밀도(xy/yaw_goal_tolerance) 자체는 원래
+      # 요구사항이라 안 건드리고, "진행 중"으로 인정하는 이동량/유예시간만 완화한다.
+      required_movement_radius: 0.05
+      movement_time_allowance: 30.0
 
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -108,63 +157,62 @@ controller_server:
       yaw_goal_tolerance: 0.05    # 약 3도
       stateful: true
 
+    # DWBLocalPlanner(dwb_core) -> RegulatedPurePursuitController 교체 이유: DWB의
+    # RotateToGoal 크리틱은 미분구동 로봇처럼 "제자리 회전"(linear.x=0, angular.z!=0)을
+    # 명령할 수 있는데, 이 차는 애커먼만(자전거 모델)이라 그 명령을 물리적으로 수행할 수
+    # 없다 — cmd_vel_bridge.py가 그걸 [조향각 최대, 속도 0]으로 변환해서 바퀴만 꺾인 채
+    # 영원히 정지해 있는 것을 실측 확인함(2026-08-19, Gazebo 시뮬레이션에서 목표까지
+    # 4.48m 경로는 나왔는데 "남은 거리"가 2분 넘게 그대로였음). RegulatedPurePursuit는
+    # Nav2가 애커먼만/차량형 로봇용으로 공식 권장하는 컨트롤러 — 항상 curvature 기반으로
+    # (v,w) 쌍을 계산해서 linear.x가 0이 되는 명령을 내지 않는다.
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: true
-      min_vel_x: 0.0
-      min_vel_y: 0.0
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       # 실측 최대 지상속도는 1.449 m/s(cmd=20, 실제속도측정.md)지만, 주차는 5cm/3도 정밀도가
-      # 필요한 정지 기동이라 안전 여유를 크게 두고 0.4 m/s로 제한(추후 실차에서 오버슈트/
+      # 필요한 정지 기동이라 안전 여유를 크게 두고 0.3 m/s로 제한(추후 실차에서 오버슈트/
       # 진동 없으면 올려도 됨).
-      max_vel_x: 0.4
-      max_vel_y: 0.0
-      # steer=30deg, v=0.4m/s 가정 시 angular_z = v*tan(steer)/WHEELBASE_M ≈ 0.69 rad/s 역산 —
-      # 실측 아님, 추정치.
-      max_vel_theta: 0.8
-      min_speed_xy: 0.0
-      max_speed_xy: 0.4
-      min_speed_theta: 0.0
-      acc_lim_x: 0.5           # 실측 가속도 데이터 없음 — 저속 주차 기동 기준 보수적 추정치
-      acc_lim_y: 0.0
-      acc_lim_theta: 1.5       # 실측 없음, 추정치
-      decel_lim_x: -0.5
-      decel_lim_y: 0.0
-      decel_lim_theta: -1.5
-      vx_samples: 20
-      vy_samples: 0
-      vtheta_samples: 20
-      sim_time: 1.5
-      linear_granularity: 0.05
-      angular_granularity: 0.025
+      desired_linear_vel: 0.3
+      lookahead_dist: 0.4
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.6
+      lookahead_time: 1.5
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.05
-      trans_stopped_velocity: 0.25
-      short_circuit_trajectory_evaluation: true
-      stateful: true
-      critics:
-        [
-          "RotateToGoal",
-          "Oscillation",
-          "BaseObstacle",
-          "GoalAlign",
-          "PathAlign",
-          "PathDist",
-          "GoalDist",
-        ]
-      # [2026-08-18] 0.02 -> 0.5로 상향. 원래 값은 표준 turtlebot3 템플릿에서 그대로 가져온
-      # 것인데, PathAlign(32)/PathDist(32) 등 경로추종 비용에 비해 장애물 회피 비중이 너무
-      # 낮아서 실행 중(컨트롤러 단계)엔 벽 근접을 거의 무시하고 경로를 고수하는 쪽으로
-      # 흘렀을 수 있다 — 팽창영역(플래너 단계)만으로는 실행 중 오차/드리프트를 못 잡아준다.
-      BaseObstacle.scale: 0.5
-      PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
-      RotateToGoal.lookahead_time: -1.0
+      # [2026-08-22] 여기서부터 pull받은 팀원 커밋(190b764)과 병합충돌 발생 — 팀원 쪽
+      # (critics/BaseObstacle.scale 등)은 DWBLocalPlanner 시절 설정을 손본 것인데, 이
+      # 컨트롤러는 이미 위(line 169) plugin이 RegulatedPurePursuitController로 바뀐 뒤라
+      # critics 파라미터 자체가 안 먹는다(DWB 전용 개념) — 팀원 브랜치가 DWB→RPP 전환
+      # 커밋보다 먼저 갈라져서 그 사실을 몰랐던 것으로 보임. RPP 설정(아래, 오늘 세션
+      # 내내 실측 튜닝한 것)만 남기고 DWB critics 쪽은 버린다. "장애물 회피 비중을
+      # 올린다"는 팀원 의도 자체는 아래 use_cost_regulated_linear_velocity_scaling +
+      # regulated_linear_scaling_*로 RPP 방식으로 이미 반영돼 있다.
+      use_velocity_scaled_lookahead_dist: false
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.6
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: true
+      # [2026-08-20] 곡률 기반 감속만으로는 좁은 통로 "직선" 구간(곡률은 작은데 벽은
+      # 가까운 경우)에서 속도를 안 줄여서, 추종오차가 그대로 벽 접촉으로 이어지는 사고가
+      # 반복됨(마진을 올려도 다른 지점에서 재현) — costmap 비용(=장애물 근접도) 기반
+      # 감속도 같이 켜서, 곡률과 무관하게 벽 가까이에서는 항상 천천히/정밀하게 추종하게 한다.
+      use_cost_regulated_linear_velocity_scaling: true
+      # 아래 costmap inflation_layer의 cost_scaling_factor와 반드시 같은 값이어야
+      # RPP가 비용→실제거리를 올바르게 역산한다(안 맞으면 감속 타이밍이 어긋남).
+      inflation_cost_scaling_factor: 8.0
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.15
+      use_fixed_curvature_lookahead: false
+      curvature_lookahead_dist: 0.25
+      # 애커먼만 차량은 제자리 회전이 불가능하므로 반드시 false — Nav2 공식 문서도
+      # "ackermann 로봇은 항상 false로 두라"고 명시함. false면 큰 헤딩오차도 회전이 아니라
+      # curvature를 크게 줘서(=조향각을 크게) 전진하며 도는 방식으로만 처리한다.
+      use_rotate_to_heading: false
+      max_angular_accel: 3.2
+      max_robot_pose_search_dist: 10.0
+      # min_turning_radius = WHEELBASE_M / tan(ANGLE_MAX_DEG) = 0.335 / tan(80°) ≈ 0.059m
+      # (vehicle_spec.py 실측값 기반 역산치, 실측 아님).
+      min_turning_radius: 0.06
+      use_interpolation: true
+      allow_reversing: false
 
 local_costmap:
   local_costmap:
@@ -175,21 +223,55 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 3
-      height: 3
+      # [2026-08-22] 3x3m -> 5x5m. 실행 중 "Dimensions of the costmap are too small
+      # to encapsulate the robot footprint at current speeds!"(RegulatedPurePursuit)
+      # 경고와 함께 "Sensor origin ... out of map bounds"(로봇이 롤링 윈도우 밖으로
+      # 나가 raytrace 불가)가 반복 관측됨 — inflation_radius/cost_scaling_factor
+      # 튜닝과는 무관한 별개 원인이라 크기만 키운다(장애물 회피 민감도 관련 값은 그대로 둠).
+      width: 5
+      height: 5
       resolution: 0.05
+      # 직사각형 footprint(길이 0.64 x 폭 0.31)로 한 번 바꿔봤으나, RegulatedPurePursuit의
+      # collision-lookahead 계산이 회전된 사각형 스윕을 잘못 처리하는 것으로 보여
+      # 스폰 직후부터 "detected collision ahead!"로 아예 못 움직이는 회귀가 발생함
+      # (2026-08-19 실측) — 원형 근사(robot_radius)로 되돌림. 내부 기둥 사이 좁은
+      # 통로(~0.9m) 클리어런스 문제는 cost_scaling_factor로 대응 중(아래 참고).
       # 실측 길이0.64m x 폭0.31m의 외접원 반경 ≈ 0.36m(base_link=차량 중심 근사, 정확한
       # 축 위치 미실측이라 근사치).
       robot_radius: 0.36
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # [2026-08-18] 기존 inflation_radius(0.3)가 robot_radius(0.36)보다 작아서 팽창 비용
-        # 구배가 차체 반경 안쪽에서 끝나버리는 버그였다 — 사실상 "벽에 거의 닿아야 비용이
-        # 오른다"는 뜻이라 벽에 붙는 경로/충돌을 못 막았다. inflation_radius는 반드시
-        # robot_radius보다 커야 실제 완충구역이 생긴다(0.36 + 약 0.1m 여유 = 0.45).
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+        # [2026-08-22] 팀원 커밋(190b764)이 여기서 inflation_radius를 0.45(robot_radius
+        # 0.36보다 크게)로 고치자고 제안했는데 — 진단(inflation_radius<robot_radius면
+        # 완충구역이 사실상 없다)은 정확하다. 다만 오늘 이 세션에서 실측으로 이미 그
+        # 값(0.45)을 시도해봐서 안다: robot_radius(0.36)+inflation_radius(0.45)=0.81m가
+        # 주차영역 A 목표(벽에서 0.5m)보다 커서, 그 값을 쓰면 목표 지점 자체가 코스트맵
+        # 상 "통행불가" 영역에 들어가 플래너가 계획 자체를 못 짠다(아래 0.1 관련 주석
+        # 참고, 이게 바로 그 실측 근거). 그래서 inflation_radius는 낮게 유지하고 대신
+        # cost_scaling_factor를 올리는 쪽으로 오늘 세션 내내 튜닝했다 — 아래 값 유지.
+        # inflation_radius를 0.1로 줄인 만큼(주차영역 A 목표 도달을 위해) 장애물을 밀어내는
+        # 힘도 약해져서, 실측 결과 좁은 통로(내부 기둥 사이 ~1m)에서 경로가 한쪽 장애물에
+        # 거의 닿을 정도로 붙어버리는 것을 확인함(2026-08-19, base_link가 기둥에서
+        # 0.25m까지 근접, robot_radius 0.36m보다 가까움 — "Failed to make progress"로
+        # 컨트롤러가 정지). inflation_radius(도달 가능성과 직결)는 더 못 줄이니, 대신
+        # cost_scaling_factor를 3.0->8.0으로 높여 좁은 반경 안에서도 장애물 근처 비용이
+        # 훨씬 가파르게 커지도록 해서 경로가 통로 중앙 쪽으로 더 붙게 유도한다.
+        # [2026-08-20] 8.0에서도 마진을 올려가며 재현되는 벽 접촉이 계속돼서 12.0으로
+        # 추가 상향(마진/풋프린트는 그대로 — 경로 "선호"만 더 강하게 중앙으로 유도).
+        # FollowPath.inflation_cost_scaling_factor와 반드시 같은 값이어야 함(위 참고).
+        # [2026-08-20] 12.0으로 올린 직후 스폰 위치 근처에서 "Starting point in lethal
+        # space"가 새로 발생 — 이전(8.0)엔 없던 증상이라 회귀 의심돼 8.0으로 되돌리고
+        # use_cost_regulated_linear_velocity_scaling 단독 효과부터 분리 확인한다.
+        cost_scaling_factor: 8.0
+        # 원래 0.3 — 주차영역 A 목표(0,4.2)가 벽에서 정확히 0.5m 떨어져 있는데,
+        # robot_radius(0.36) + inflation_radius(0.3) = 0.66m가 그보다 커서 목표 지점
+        # 자체가 코스트맵 inflation 영역(사실상 통행불가로 취급됨)에 걸려 플래너가
+        # "failed to create plan with tolerance 0.50"로 계속 실패하는 것을 실측 확인함
+        # (2026-08-19). robot_radius(0.36) + 0.1 = 0.46m < 0.5m로 여유를 두기 위해
+        # 0.1로 낮춤 — 목표 좌표 자체는 그대로 두고(실측/대회 기준일 수 있어 안 건드림)
+        # 안전여유만 줄인 것이므로, 장애물 회피 민감도가 전반적으로 낮아짐에 유의.
+        inflation_radius: 0.1
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -220,7 +302,20 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.36      # local_costmap과 동일 근거(실측 길이/폭 외접원)
+      # [2026-08-20] robot_radius(원형 근사, 0.36m) -> 실제 사각형 footprint로 교체.
+      # local_costmap(RegulatedPurePursuit가 씀)은 회귀 이력 때문에 원형을 그대로
+      # 두지만, global_costmap은 SmacPlannerHybrid(위 planner_server.GridBased)의
+      # 계획 단계 충돌검사에만 쓰이고 RPP의 스윕 로직과 무관하므로 여기만 바꾼다.
+      # 치수: VEHICLE_LENGTH_M=0.64, VEHICLE_WIDTH_M=0.31(vehicle_spec.py), base_link
+      # 원점=차량 중심(urdf/xycar.urdf 주석과 동일 전제) -> 반장/반폭 0.32/0.155.
+      # [2026-08-20 추가] 실치수 그대로(마진 0)로 먼저 돌려봤더니 AMCL/경로추종 오차
+      # 때문에 실제로 벽과 접촉하는 걸 실측 확인함(로봇 현재위치가 지도 occupied
+      # 픽셀과 정확히 겹침, clearance=0.0m). 마진 0.04m로 올렸다가도 다른 지점(벽까지
+      # 여유 0.22m인 통로)에서 또 접촉 확인(2026-08-20) — 0.04m로는 부족해서 0.07m로
+      # 올린다(트랙 프로젝트 hybrid_astar.py의 ASTAR_VEHICLE_MARGIN_M과 같은 설계 —
+      # 실측 풋프린트 + 명시적 여유). 그래도 원형 근사(0.36m)보다는 작아 통로 통과
+      # 능력은 유지되길 기대.
+      footprint: "[[0.39, 0.225], [0.39, -0.225], [-0.39, -0.225], [-0.39, 0.225]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -243,15 +338,43 @@ global_costmap:
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # local_costmap과 동일한 이유로 robot_radius(0.36)보다 크게 수정.
-        cost_scaling_factor: 4.0
-        inflation_radius: 0.45
+        # local_costmap과 동일한 이유(위 §local_costmap.inflation_layer 주석의 팀원
+        # 커밋 관련 설명 참고)로 robot_radius(0.36)+0.45=0.81m는 목표(벽에서 0.5m)를
+        # 통행불가로 만들어 안 쓴다.
+        # inflation_radius를 0.1로 줄인 만큼(주차영역 A 목표 도달을 위해) 장애물을 밀어내는
+        # 힘도 약해져서, 실측 결과 좁은 통로(내부 기둥 사이 ~1m)에서 경로가 한쪽 장애물에
+        # 거의 닿을 정도로 붙어버리는 것을 확인함(2026-08-19, base_link가 기둥에서
+        # 0.25m까지 근접, robot_radius 0.36m보다 가까움 — "Failed to make progress"로
+        # 컨트롤러가 정지). inflation_radius(도달 가능성과 직결)는 더 못 줄이니, 대신
+        # cost_scaling_factor를 3.0->8.0으로 높여 좁은 반경 안에서도 장애물 근처 비용이
+        # 훨씬 가파르게 커지도록 해서 경로가 통로 중앙 쪽으로 더 붙게 유도한다.
+        # [2026-08-20] 8.0에서도 마진을 올려가며 재현되는 벽 접촉이 계속돼서 12.0으로
+        # 추가 상향(마진/풋프린트는 그대로 — 경로 "선호"만 더 강하게 중앙으로 유도).
+        # FollowPath.inflation_cost_scaling_factor와 반드시 같은 값이어야 함(위 참고).
+        # [2026-08-20] 12.0으로 올린 직후 스폰 위치 근처에서 "Starting point in lethal
+        # space"가 새로 발생 — 이전(8.0)엔 없던 증상이라 회귀 의심돼 8.0으로 되돌리고
+        # use_cost_regulated_linear_velocity_scaling 단독 효과부터 분리 확인한다.
+        cost_scaling_factor: 8.0
+        # 원래 0.3 — 주차영역 A 목표(0,4.2)가 벽에서 정확히 0.5m 떨어져 있는데,
+        # robot_radius(0.36) + inflation_radius(0.3) = 0.66m가 그보다 커서 목표 지점
+        # 자체가 코스트맵 inflation 영역(사실상 통행불가로 취급됨)에 걸려 플래너가
+        # "failed to create plan with tolerance 0.50"로 계속 실패하는 것을 실측 확인함
+        # (2026-08-19). robot_radius(0.36) + 0.1 = 0.46m < 0.5m로 여유를 두기 위해
+        # 0.1로 낮춤 — 목표 좌표 자체는 그대로 두고(실측/대회 기준일 수 있어 안 건드림)
+        # 안전여유만 줄인 것이므로, 장애물 회피 민감도가 전반적으로 낮아짐에 유의.
+        inflation_radius: 0.1
       always_send_full_costmap: true
 
 map_server:
   ros__parameters:
     use_sim_time: false
-    # yaml_filename은 launch 인자(map)로 전달됨
+    # RewrittenYaml(nav2_common/launch/rewritten_yaml.py)은 yaml에 "이미 있는" leaf 키만
+    # 덮어쓰고 없는 키는 추가하지 않는다 — 그래서 launch 인자(map)로 전달하려면 여기 빈
+    # 값이라도 반드시 있어야 한다(nav2_bringup 공식 기본 params.yaml도 동일 패턴).
+    # 이 줄이 없으면 map_server가 "parameter 'yaml_filename' is not initialized"로
+    # configure 단계에서 즉시 죽는다(ros-humble-nav2-bringup 1.1.20 실제 설치본으로
+    # 재현 확인, 2026-08-19).
+    yaml_filename: ""
 
 map_saver:
   ros__parameters:
@@ -271,38 +394,41 @@ planner_server:
     # 꺾임을 못 따라가고 코너를 잘라먹으며 벽을 스칠 수 있다. SmacPlannerHybrid는 최소 회전반경
     # 제약을 넣어 "차가 실제로 따라갈 수 있는" 곡선 경로만 생성한다(=사용자가 말한 Modified A*).
     GridBased:
-      plugin: "nav2_smac_planner::SmacPlannerHybrid"
-      downsample_costmap: false
-      downsampling_factor: 1
-      tolerance: 0.25
+      # [2026-08-22] 팀원 커밋(190b764)과 병합충돌 — 팀원도 독립적으로 같은 결론
+      # (NavfnPlanner->SmacPlannerHybrid)에 도달했지만 세 가지가 이 세션의 실측
+      # 검증과 안 맞아서 팀원 쪽을 버리고 내 쪽(아래)을 남긴다:
+      #  1) plugin 이름이 "nav2_smac_planner::SmacPlannerHybrid"(콜론 두 개) 형식인데,
+      #     이 환경에서 pluginlib이 "package/ClassAlias" 슬래시 형식만 인식하고 콜론
+      #     형식은 "class ... does not exist" FATAL로 planner_server가 죽는 걸 오늘
+      #     실측 확인함(behavior_server의 동일 문제와 같은 원인, 아래 behavior_server
+      #     주석도 참고).
+      #  2) motion_model_for_search: REEDS_SHEPP(후진 허용)을 썼는데, FollowPath
+      #     (RegulatedPurePursuitController)는 allow_reversing: false라 후진 구간이
+      #     있는 경로를 애초에 못 따라간다 — 플래너와 컨트롤러가 서로 안 맞는 상태.
+      #  3) minimum_turning_radius: 0.6을 "최대조향각 30도(설계값)" 가정으로 역산했는데,
+      #     이 저장소의 vehicle_spec.py는 ANGLE_MAX_DEG=80.0(서보 클램프값)을 명시하고
+      #     있고 FollowPath.min_turning_radius도 그 값 기준(0.06)으로 이미 맞춰져 있다
+      #     — 두 플러그인이 같은 차량 물리 제약을 써야 하는데 0.6 vs 0.06으로 10배 차이.
+      # [2026-08-20] NavfnPlanner -> SmacPlannerHybrid 교체. NavFn은 로봇을 원형
+      # inflation(robot_radius/inflation_radius)으로만 판단해서 "통로는 넉넉하게,
+      # 목표(벽에서 0.5m)는 빡빡하게"라는 상충을 costmap 파라미터 하나로 억지로
+      # 맞춰야 했다(위 inflation_radius 0.1 관련 주석들 참고) — 그래도 안 됨: 실측
+      # 결과 로봇이 실제로 넓은 통로(x≈0.5~0.9)를 놔두고 더 좁은 쪽(x≈1.3~1.9, 벽까지
+      # 5cm)으로 경로를 잡아 거기서 막혔다(2026-08-20, parking_map.pgm 픽셀 분석+
+      # AMCL pose 실측으로 확인). SmacPlannerHybrid는 애커먼만 운동학(조향 곡률)과
+      # 실제 풋프린트로 매 후보 pose를 충돌검사하므로, 원형 근사가 만드는 이 왜곡을
+      # 근본적으로 피할 수 있다 — 아래 global_costmap의 footprint(사각형)와 짝을 이룸.
+      # pluginlib 조회명은 "package/ClassAlias" 형식(위 NavfnPlanner 때와 동일 이유).
+      plugin: "nav2_smac_planner/SmacPlannerHybrid"
+      tolerance: 0.5
       allow_unknown: false   # 주차장은 맵 밖 미탐사 영역으로 계획하지 않도록 false 권장
-      max_iterations: 1000000
-      max_on_approach_iterations: 1000
-      max_planning_time: 5.0
-      # REEDS_SHEPP: 전진뿐 아니라 후진도 허용(전진만 되는 DUBIN 대신) — 주차는 후진 진입이
-      # 필요한 경우가 많다.
-      motion_model_for_search: "REEDS_SHEPP"
-      angle_quantization_bins: 72
-      analytic_expansion_ratio: 3.5
-      analytic_expansion_max_length: 3.0
-      # 실측 축거(WHEELBASE_M=0.335m) 기준, 최대조향각을 UMK planner/hybrid_astar.py와 동일한
-      # 30도(실측 아닌 설계값)로 가정해 산출: r = wheelbase / tan(30°) ≈ 0.58m. 이보다 타이트한
-      # 회전은 실제로 못 도니 약간의 여유를 더해 0.6m로 설정(실차에서 좁은 코너 진입 실패하면
-      # 낮추고, 진동/오버슈트 있으면 올릴 것).
-      minimum_turning_radius: 0.6
-      reverse_penalty: 2.0
-      change_penalty: 0.0
-      non_straight_penalty: 1.2
-      cost_penalty: 2.0
-      retrospective_penalty: 0.025
-      lookup_table_size: 20.0
-      cache_obstacle_heuristic: false
-      smooth_path: true
-      smoother:
-        max_iterations: 1000
-        w_smooth: 0.3
-        w_data: 0.2
-        tolerance: 1.0e-10
+      # FollowPath(RegulatedPurePursuitController)가 allow_reversing: false라 후진
+      # 구간이 있는 경로를 못 따라간다 — 그래서 REEDS_SHEPP(후진 허용) 대신
+      # DUBIN(전진만)으로 컨트롤러 제약과 일치시킨다.
+      motion_model_for_search: "DUBIN"
+      # WHEELBASE_M / tan(ANGLE_MAX_DEG) = 0.335 / tan(80°) ≈ 0.06m — 위 FollowPath의
+      # min_turning_radius와 동일 값(같은 차량 물리 제약이므로 두 플러그인이 일치해야 함).
+      minimum_turning_radius: 0.06
 
 behavior_server:
   ros__parameters:
@@ -311,12 +437,15 @@ behavior_server:
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
     behavior_plugins: ["spin", "backup", "wait"]
+    # nav2_navfn_planner와 동일한 이유(pluginlib 조회명은 "package/ClassAlias" 형식) —
+    # nav2_behaviors의 behavior_plugin.xml도 슬래시로 export돼 있음. "::" 형식은
+    # behavior_server가 "class ... does not exist" FATAL로 죽는 것을 확인(2026-08-19).
     spin:
-      plugin: "nav2_behaviors::Spin"
+      plugin: "nav2_behaviors/Spin"
     backup:
-      plugin: "nav2_behaviors::BackUp"
+      plugin: "nav2_behaviors/BackUp"
     wait:
-      plugin: "nav2_behaviors::Wait"
+      plugin: "nav2_behaviors/Wait"
     global_frame: odom
     robot_base_frame: base_link
     transform_timeout: 0.1
