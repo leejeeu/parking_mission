@@ -118,9 +118,11 @@ class ParkingNavigator(Node):
         # [2026-08-24] 3분(180초) 안에 A/B 주차 + 출발지 복귀까지 전부 마쳐야 하는
         # 제약이 생겨서(과거엔 구역 하나만 가면 끝이라 여유로웠음) 30초 → 15초로 축소됐었으나,
         # 실측 결과(데드레커닝 도입 후) 첫 웨이포인트 도달까지만 20초 넘게 걸리는 걸
-        # 확인해서 25초로 재상향 — 전체 미션 예산(mission_deadline_sec=170s) 안에서는
-        # 여전히 여유 있음(START->A 구간 하나만 이 정도 쓰고 나머지 레그는 병목이 없음).
-        self.declare_parameter('corridor_bypass_timeout_sec', 25.0)
+        # 확인해서 25초로, 그 뒤 좁은 통로 5개 웨이포인트를 전부 통과(wp1이 15초 가까이
+        # 걸림)하고 마지막 긴 직선구간(0.95,3.55, 1.8m)까지 가는 데는 25초로도 부족한
+        # 걸 실측 확인해서 45초로 재상향 — 전체 미션 예산(mission_deadline_sec=170s)
+        # 안에서는 여전히 여유 있음(START->A 구간 하나만 이 정도 쓰고 나머지 레그는 병목이 없음).
+        self.declare_parameter('corridor_bypass_timeout_sec', 55.0)
 
         # ── 목표 근처 전용 "정밀 접근"(docking) — 2026-08-20 ──
         #   README §6-2/§6-4에 이미 적혀있던 문제: 주차 목표가 벽에서 0.5m 안쪽이라
@@ -610,22 +612,57 @@ class ParkingNavigator(Node):
     # 동일 지점에서 멈춤 — 튜닝으로 안 풀리는 기하학적 문제로 판단). 모서리에서
     # 충분히 남쪽(clearance 0.585m)인 이 점을 먼저 거치게 해서, 모서리를 넓게 돈
     # 뒤 이미 남쪽 열린 공간에 있는 상태에서 (1.00,1.60)로 짧게 북상하도록 유도한다.
+    # [2026-08-24] 위 (1.00,1.60)/(1.00,1.70)/(0.95,1.75)는 Dijkstra 최단경로가 준
+    # "도달 가능한" 지점이었을 뿐 실제 "가장 안전한"(양쪽 벽에서 최대로 먼) 지점이
+    # 아니었다 — 사용자가 시뮬레이션에서 차가 벽에 긁히는 걸 직접 확인, distance_transform
+    # 으로 이 y구간(1.55~1.85)의 진짜 중심선(최근접 장애물까지 거리 최대인 x)을 다시
+    # 계산해보니 x≈0.50~0.58(여유 0.67~0.80m)로, 기존 x=1.00(여유 0.30~0.35m)보다
+    # 훨씬 넉넉했다. y=1.90~3.55 구간은 중심선이 x≈0.63->0.98로 완만하게 이동한다 —
+    # 이 곡선을 따라가도록 중간 전환점을 추가.
+    # [2026-08-24] (1.20,1.15)->(0.55,1.65) 직행(거리 1.44m)이 조향으로 못 따라잡고
+    # 그냥 목표를 지나쳐 벽 밖(x=-0.60)까지 가버리는 걸 실측 확인 — 사용자 제안대로
+    # 손으로 몇 점 고르는 대신, distance_transform 중심선을 0.20m 간격으로 촘촘히
+    # 리샘플링해서 웨이포인트 목록 전체를 계산했다(scripts, ROS2_ws/src/maps 기준
+    # world 좌표). 각 세그먼트가 짧아(<=0.2m 대각선) 조향이 못 따라가 지나치는
+    # 문제 자체가 구조적으로 안 생긴다. 중심선 탐색은 "이전 지점 ±0.15m 근방"으로만
+    # 제한해서(넓게 잡으면 서쪽 완전히 다른 개활지로 새는 걸 확인함) 경로 연속성을
+    # 보장했다.
     ROUTE_BYPASS_CENTERLINE = {
         ('START', 'A'): [
-            (1.20, 1.15),
-            (1.00, 1.60),
-            (1.00, 1.70),
-            (0.95, 1.75),
-            (0.95, 3.55),
-            (1.00, 3.75),
+            (1.05, 1.15),
+            (0.90, 1.35),
+            (0.75, 1.55),
+            (0.60, 1.75),   # 병목 진짜 중심선(가장 좁은 지점), 여유 0.70m대
+            (0.68, 1.95),
+            (0.78, 2.15),
+            (0.88, 2.35),
+            (0.93, 2.55),
+            (0.93, 2.75),
+            (0.93, 2.95),
+            (0.93, 3.15),
+            (0.98, 3.35),
+            (0.98, 3.55),
+            # [2026-08-24] (1.00,3.75, clearance 0.350m) -> (0.90,4.00, clearance
+            # 0.412m)로 교체 — 실측 결과 (1.00,3.75) 근처(허용오차 0.15m 안에서
+            # 도달한 실제 지점 (1.03,3.60), clearance 0.304m)가 Nav2 global costmap
+            # 기준으로 "Starting point in lethal space"였다. 지도 조회로 주변
+            # 후보들의 clearance를 비교해 가장 여유로운 지점으로 교체.
+            (0.90, 4.00),
         ],
     }
-    # 위 리스트 중 앞부분(폭 0.7~1m 병목 통로 구간)만 도달판정을 타이트하게(0.20m)
-    # 잡는다 — 느슨한 0.45m를 쓰면 실제로는 벽에서 0.44m 옆(=거의 붙은 위치)에
-    # 있는데도 "도달"로 인정돼버려서, 다음 목표로 방향을 트는 순간 이미 붙어있던
-    # 벽에 눌리는 걸 지도 원본 해상도 조회로 실측 확인함(그 지점이 실제 벽 픽셀).
+    # [2026-08-24] 세그먼트가 전부 짧고(0.20m 간격) 촘촘한 중심선이라, 앞부분 몇 개만
+    # 골라 타이트하게/느슨하게 나누던 예전 방식 대신 마지막 직전까지 전부 같은
+    # 기준(0.20m)으로 통일 — 짧은 구간에서 느슨한 허용오차(0.45m 이상)를 쓰면
+    # 다음 세그먼트를 시작하기도 전에 이미 "도달"로 오판될 수 있다.
     ROUTE_BYPASS_NARROW_COUNT = {
-        ('START', 'A'): 5,  # (0.95,3.55)까지 — 마지막 (1.00,3.75)는 넓은 구간이라 제외
+        ('START', 'A'): 13,  # 마지막(0.90,4.00) 제외 전부
+    }
+    # [2026-08-24] AMCL 국소함정은 병목 진입~진짜 병목 통과 직후(idx 0~4,
+    # (0.68,1.95)까지)에만 있었다 — 그 이후(전환/직선구간)는 AMCL로 복귀해 데드레커닝
+    # 순수적분 누적오차를 피한다(실측: 긴 구간 전체를 데드레커닝에 맡기면 Nav2 인계
+    # 시점에 실제 위치와 최대 1m 어긋남 확인됨).
+    ROUTE_BYPASS_DR_COUNT = {
+        ('START', 'A'): 5,
     }
 
     def _run_route_bypass(self, from_leg: str, to_leg: str):
@@ -675,25 +712,46 @@ class ParkingNavigator(Node):
         # 병목 통로 구간(ROUTE_BYPASS_NARROW_COUNT)만은 예외로 0.20m까지 좁힌다 —
         # 위 ROUTE_BYPASS_CENTERLINE 주석의 "벽 픽셀 실측 확인" 참고.
         narrow_n = self.ROUTE_BYPASS_NARROW_COUNT.get((from_leg.upper(), to_leg.upper()), 0)
+        dr_n = self.ROUTE_BYPASS_DR_COUNT.get((from_leg.upper(), to_leg.upper()), 0)
         for idx, (wx, wy) in enumerate(waypoints):
             is_final = (idx == len(waypoints) - 1)
             if is_final:
                 seg_tol = xy_tol
+            elif idx == 0:
+                # [2026-08-24] 맨 앞 진입각 보정 지점(1.20,1.15)은 실제 장애물까지
+                # 0.585m 여유가 있는 완전히 열린 공간이다(지도 조회로 확인) — 그런데
+                # 타이트한 허용오차(0.20m)를 적용했더니 차가 0.20~0.21m 경계에서
+                # 못 넘어가고 계속 맴돌아, 여기서만 14초(전체 25초 예산의 절반 이상)를
+                # 날리는 걸 실측 확인함. 이 지점은 좁은 통로가 아니라 사전 정렬용
+                # 여유공간이라 느슨한 허용오차로 되돌린다 — 진짜 좁은 구간(idx>=1)만
+                # 타이트하게 유지.
+                seg_tol = max(xy_tol * 3.0, 0.25)
             elif idx < narrow_n:
                 seg_tol = max(xy_tol * 1.3, 0.20)
             else:
                 seg_tol = max(xy_tol * 3.0, 0.25)
-            reached = self._drive_corridor_segment(wx, wy, seg_tol, speed_param, deadline)
+            # [2026-08-24] 데드레커닝(_dr_pose)은 순수 적분이라 시간이 지날수록
+            # 오차가 누적된다 — 실측 확인: 병목 진입부(narrow_n 구간)를 지나 긴
+            # 직선구간(마지막 웨이포인트)까지 40초 넘게 전부 데드레커닝만 믿게 했더니,
+            # Nav2 인계 시점에 실제(AMCL) 위치가 데드레커닝 추정과 약 1m 어긋나 있었다
+            # (Nav2가 그 실제 위치 기준으로 lethal space 판정). AMCL 국소함정은
+            # narrow_n 구간(병목 진입~통과 직후)에만 있었으므로, 그 이후(먼 직선구간)는
+            # 다시 AMCL을 신뢰해 누적오차를 원천 차단한다.
+            use_dr = idx < dr_n
+            reached = self._drive_corridor_segment(wx, wy, seg_tol, speed_param, deadline, use_dr=use_dr)
             if not reached:
                 return  # 타임아웃 — 남은 지점은 건너뛰고 Nav2로 넘어감(기존 정책과 동일)
         self.get_logger().info('병목 구간 통과 완료 — 모든 중심선 웨이포인트 도달')
 
-    def _drive_corridor_segment(self, wx, wy, xy_tol, speed_param, deadline_ns) -> bool:
+    def _drive_corridor_segment(self, wx, wy, xy_tol, speed_param, deadline_ns, use_dr=True) -> bool:
         """_run_route_bypass()의 한 웨이포인트 구간을 주행 — 도달하면 True, 공유
         deadline_ns를 넘기면 False를 반환한다(정지 감지+backoff 로직은 기존과 동일,
-        구간이 바뀔 때마다 진행추적 상태를 리셋한다). [2026-08-24] 위치는 AMCL이
-        아니라 _dr_pose()(데드레커닝, _run_route_bypass 주석 참고)를 쓴다."""
-        progress_pose = self._dr_pose()
+        구간이 바뀔 때마다 진행추적 상태를 리셋한다). [2026-08-24] use_dr=True면
+        AMCL 대신 _dr_pose()(데드레커닝, _run_route_bypass 주석 참고)를 쓴다 — 병목
+        진입부(narrow_n)에만 적용, 그 이후 긴 직선구간은 데드레커닝 누적오차를
+        피하려 다시 AMCL(use_dr=False)을 쓴다."""
+        pose_fn = self._dr_pose if use_dr else (lambda: self._cur_pose)
+        progress_pose = pose_fn()
         progress_t = self._wall_clock.now().nanoseconds
         backoff_until = None
         STUCK_MOVE_M = 0.03
@@ -711,7 +769,7 @@ class ParkingNavigator(Node):
 
         while rclpy.ok():
             self._spin_once_safe(timeout_sec=0.05)
-            dr = self._dr_pose()
+            dr = pose_fn()
             if dr is None:
                 continue
             cx, cy, cyaw = dr
@@ -746,16 +804,39 @@ class ParkingNavigator(Node):
                     self._cmd_vel_pub.publish(cmd)
                     continue
                 backoff_until = None
-                progress_pose = self._dr_pose()
+                progress_pose = pose_fn()
                 progress_t = now_ns
 
             heading_err = normalize_angle(math.atan2(wy - cy, wx - cx) - cyaw)
             speed = max(speed_param * 0.4, min(speed_param, dist * 0.6))
             speed = self._front_safety_speed_cap(speed, 1.0)
             speed = self._ramp_linear_speed(speed)
-            max_angular = speed / MIN_SAFE_RADIUS_M
+            # [2026-08-24] max_angular = speed/MIN_SAFE_RADIUS_M라서 속도를 올릴수록
+            # 허용 조향각속도도 같이 커진다 — corridor_bypass_speed를 0.35->0.45로
+            # 올린 뒤 max_angular이 1.57rad/s까지 커져서, 크고 빠른 좌우 조향이
+            # 반복되며 지그재그로 상쇄되는 걸 실측 확인함(20초간 x=1.5~1.6,y=0.87에서
+            # 거의 못 움직임, heading_err도 -70도에서 거의 안 줄어듦). 속도와 무관한
+            # 절대 상한(ABS_MAX_ANGULAR)을 별도로 둬서, 직진 구간은 빠르게 가되 급격한
+            # 큰 회전 자체는 못 하게 막는다.
+            ABS_MAX_ANGULAR = 1.0
+            max_angular = min(speed / MIN_SAFE_RADIUS_M, ABS_MAX_ANGULAR)
+            # [2026-08-24] 헤딩오차가 클 때(큰 방향전환이 급함) 라이다 바이어스를
+            # 그대로 더하면 두 신호가 서로 부호가 다를 때 상쇄/증폭을 반복해서 매틱
+            # 최대좌<->최대우로 널뛰는 진동이 생기는 걸 실측 확인함(corridor_bypass_speed
+            # 상향 후 dist=0.8~0.9대에서 22틱 연속 진행 없이 진동만 함, 2026-08-24).
+            # 헤딩오차가 이미 작을 때(거의 정렬됨, 벽 스치기만 방지하면 되는 상황)만
+            # 라이다를 우선시키고, 오차가 크면(45도 이상) 헤딩추종이 항상 우선이어야
+            # 큰 방향전환 자체를 못 하고 지나쳐버리거나 진동하는 문제가 안 생긴다.
+            # [2026-08-24] 위 조건부 가중치로도 못 잡힌 진동의 진짜 원인을 찾음 —
+            # 실측 결과 이 지점(장애물까지 1.5m 이상 여유, 지도로 확인)에서도
+            # lidar_bias가 매틱 큰 값<->0 사이를 오가서, 조향 램프가 매번 초기화되다시피
+            # 하며 10초간 명령은 계속 -1.0rad/s인데 실제 헤딩은 17도밖에 안 변하는
+            # 것까지 확인함(명령의 약 1/30). 애초에 이 라이다 조향보정은 AMCL 오차
+            # 보정용으로 넣은 것인데, 이제 이 구간 전체가 데드레커닝(_dr_pose)을 쓰므로
+            # 그 문제 자체가 해소됐다 — 병목구간에서는 조향보정을 빼고 헤딩추종만
+            # 쓴다(감속용 _front_safety_speed_cap은 그대로 유지, 그건 라이다 정면
+            # 거리만 보고 진동 소스가 아니었음).
             angular_z = kp * heading_err
-            angular_z += self._lidar_steer_bias(1.0)
             self.get_logger().info(
                 f'[진단] 병목우회 cur=({cx:.2f},{cy:.2f},{math.degrees(cyaw):.0f}deg) target=({wx:.2f},{wy:.2f}) '
                 f'dist={dist:.2f} heading_err={math.degrees(heading_err):.0f}deg speed={speed:.2f} '
