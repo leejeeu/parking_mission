@@ -3,6 +3,7 @@ import sys
 
 import rclpy
 from rclpy.action import ActionClient
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
@@ -52,6 +53,17 @@ class ParkingNavigator(Node):
 
     def __init__(self):
         super().__init__('parking_navigator')
+
+        # [2026-08-24] 이 노드는 use_sim_time:=true로 실행되는데, Gazebo+Nav2+AMCL을
+        # 동시에 돌리는 이 개발환경은 부하에 따라 시뮬레이션 real-time-factor가
+        # 크게 튄다 — 실측 확인: 15초 타임아웃이 실제 1.4초 만에 끝나거나(부하가
+        # 걷히며 시뮬레이션 시계가 밀린 걸 몰아서 따라잡음), 반대로 4초 넘게 정지해
+        # 있었는데도 2초 무진행 감지가 발동을 안 함(부하로 시뮬레이션 시계가 실제보다
+        # 느리게 감). 데드라인/정지감지/속도램프처럼 "실제로 몇 초가 지났는가"가
+        # 중요한 내부 타이밍 계산은 전부 이 별도 SYSTEM_TIME(실제 시계)를 쓰고,
+        # self.get_clock()(시뮬레이션 시계)는 TF/메시지 타임스탬프처럼 ROS 시스템
+        # 전체와 시간대를 맞춰야 하는 곳에만 남겨둔다.
+        self._wall_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
 
         # [2026-08-24] 공식 경기 규정 확인 결과 이 미션은 "출발 → A 주차 → B 주차 →
         # 출발지 복귀"를 전부 한 번에 수행해야 한다(과거엔 A 또는 B 중 하나에만 가고
@@ -472,16 +484,16 @@ class ParkingNavigator(Node):
         모듈 docstring 참고. 초음파는 이후 완전히 제거함). 다만 이 정리 자체(임시 구독
         대신 이미 있는 self._cur_pose 재사용)는 더 단순하고 구독도 하나 줄어드는
         정당한 개선이라 초음파 제거와 무관하게 그대로 유지한다."""
-        deadline = self.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
+        deadline = self._wall_clock.now().nanoseconds + int(timeout_sec * 1e9)
         republish_period_sec = 1.0
-        next_republish = self.get_clock().now().nanoseconds
+        next_republish = self._wall_clock.now().nanoseconds
 
         self.publish_initial_pose()
-        while self._cur_pose is None and self.get_clock().now().nanoseconds < deadline:
+        while self._cur_pose is None and self._wall_clock.now().nanoseconds < deadline:
             self._spin_once_safe(timeout_sec=0.2)
-            if self._cur_pose is None and self.get_clock().now().nanoseconds >= next_republish:
+            if self._cur_pose is None and self._wall_clock.now().nanoseconds >= next_republish:
                 self.publish_initial_pose()
-                next_republish = self.get_clock().now().nanoseconds + int(republish_period_sec * 1e9)
+                next_republish = self._wall_clock.now().nanoseconds + int(republish_period_sec * 1e9)
 
         received = self._cur_pose is not None
         if received:
@@ -656,7 +668,7 @@ class ParkingNavigator(Node):
         self._last_direct_angular_z = 0.0
         self._last_direct_angular_t_ns = None
 
-        deadline = self.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
+        deadline = self._wall_clock.now().nanoseconds + int(timeout_sec * 1e9)
         # 중간 지점은 "지나가기만" 하면 되므로 정밀 정지가 필요 없다 — xy_tol 그대로 쓰면
         # 근처에서 헤딩만 미세조정하느라 시간을 낭비할 수 있어 느슨하게(3배) 잡는다.
         # 마지막 지점만 원래 tolerance를 그대로 쓴다. [2026-08-24] 단, 폭 0.7~1m
@@ -682,7 +694,7 @@ class ParkingNavigator(Node):
         구간이 바뀔 때마다 진행추적 상태를 리셋한다). [2026-08-24] 위치는 AMCL이
         아니라 _dr_pose()(데드레커닝, _run_route_bypass 주석 참고)를 쓴다."""
         progress_pose = self._dr_pose()
-        progress_t = self.get_clock().now().nanoseconds
+        progress_t = self._wall_clock.now().nanoseconds
         backoff_until = None
         STUCK_MOVE_M = 0.03
         STUCK_TIMEOUT_SEC = 2.0
@@ -704,7 +716,7 @@ class ParkingNavigator(Node):
                 continue
             cx, cy, cyaw = dr
             dist = math.hypot(wx - cx, wy - cy)
-            now_ns = self.get_clock().now().nanoseconds
+            now_ns = self._wall_clock.now().nanoseconds
 
             if dist <= xy_tol:
                 return True
@@ -774,7 +786,7 @@ class ParkingNavigator(Node):
             self._goal_handle.cancel_goal_async()
 
         timeout_sec = self.get_parameter('docking_timeout_sec').value
-        self._docking_deadline = self.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
+        self._docking_deadline = self._wall_clock.now().nanoseconds + int(timeout_sec * 1e9)
         # ── 정지 감지 상태 ──
         # [2026-08-20] 도킹 루프엔 costmap 충돌검사가 없어서, 실제로 벽에 밀어붙인 채
         # 명령만 계속 나가는(바퀴는 헛돔) 상황이 지속되는 걸 실측 확인함(헤딩 계산
@@ -782,7 +794,7 @@ class ParkingNavigator(Node):
         # 위치 변화가 없으면 "막혔다"로 보고 후진으로 빠져나온다(2026-08-24: 후진
         # 허용 확인됨에 따라 전진전용 탈출에서 원복).
         self._docking_progress_pose = self._cur_pose
-        self._docking_progress_t = self.get_clock().now().nanoseconds
+        self._docking_progress_t = self._wall_clock.now().nanoseconds
         self._docking_backoff_until = None
 
         # K턴 상태도 레그마다 새로 시작(이전 레그에서 활성화된 채 남아있으면 안 됨).
@@ -822,7 +834,7 @@ class ParkingNavigator(Node):
             self._finish_docking(success=True)
             return
 
-        now_ns = self.get_clock().now().nanoseconds
+        now_ns = self._wall_clock.now().nanoseconds
         if now_ns >= self._docking_deadline:
             self.get_logger().error(
                 f'정밀 접근 타임아웃 — 남은거리={dist:.2f}m, 헤딩오차={math.degrees(yaw_err_to_goal):.1f}deg')
@@ -911,7 +923,7 @@ class ParkingNavigator(Node):
         차의 속도 PID(urdf/xycar.urdf ackermann_drive)가 계단형 목표치 변화를 잘 못
         따라가는 것으로 보여, 직접제어 쪽에서도 매틱 max_accel(m/s^2)만큼만 속도를
         바꾸도록 흉내낸다."""
-        now_ns = self.get_clock().now().nanoseconds
+        now_ns = self._wall_clock.now().nanoseconds
         dt = 0.1 if self._last_direct_cmd_t_ns is None else \
             max(0.0, (now_ns - self._last_direct_cmd_t_ns) / 1e9)
         self._last_direct_cmd_t_ns = now_ns
@@ -932,7 +944,7 @@ class ParkingNavigator(Node):
         바꾸도록 제한한다. _last_direct_cmd_t_ns(속도 램프용)는 같은 틱 안에서 이미
         _ramp_linear_speed()가 먼저 갱신해버리므로(dt=0이 돼 조향이 그대로 얼어붙음),
         별도 타임스탬프(_last_direct_angular_t_ns)를 쓴다."""
-        now_ns = self.get_clock().now().nanoseconds
+        now_ns = self._wall_clock.now().nanoseconds
         dt = 0.1 if self._last_direct_angular_t_ns is None else \
             max(0.0, (now_ns - self._last_direct_angular_t_ns) / 1e9)
         self._last_direct_angular_t_ns = now_ns
@@ -979,7 +991,7 @@ class ParkingNavigator(Node):
         K_TURN_SPEED = 0.15
         MIN_SAFE_RADIUS_M = 0.25
 
-        now_ns = self.get_clock().now().nanoseconds
+        now_ns = self._wall_clock.now().nanoseconds
         if (self._docking_k_turn_phase_deadline_ns is None
                 or now_ns >= self._docking_k_turn_phase_deadline_ns):
             self._docking_k_turn_phase_direction *= -1.0
@@ -1093,9 +1105,9 @@ class ParkingNavigator(Node):
 
         if self.get_parameter('set_initial_pose').value:
             wait_sec = self.get_parameter('initial_pose_wait_sec').value
-            deadline = self.get_clock().now().nanoseconds + int(wait_sec * 1e9)
+            deadline = self._wall_clock.now().nanoseconds + int(wait_sec * 1e9)
             while (self._initial_pose_pub.get_subscription_count() == 0
-                   and self.get_clock().now().nanoseconds < deadline):
+                   and self._wall_clock.now().nanoseconds < deadline):
                 self._spin_once_safe(timeout_sec=0.2)
             self.publish_initial_pose_until_amcl_ready(wait_sec)
 
@@ -1103,12 +1115,12 @@ class ParkingNavigator(Node):
         self._nav_client.wait_for_server()
 
         mission_deadline_sec = self.get_parameter('mission_deadline_sec').value
-        mission_deadline_ns = self.get_clock().now().nanoseconds + int(mission_deadline_sec * 1e9)
+        mission_deadline_ns = self._wall_clock.now().nanoseconds + int(mission_deadline_sec * 1e9)
 
         leg_results = {}
         prev_leg = 'START'  # 초기 pose 발행 직후이므로 "출발지에 있다"고 본다.
         for leg in legs:
-            if self.get_clock().now().nanoseconds >= mission_deadline_ns:
+            if self._wall_clock.now().nanoseconds >= mission_deadline_ns:
                 self.get_logger().error(
                     f"전체 미션 제한시간({mission_deadline_sec:.0f}초) 초과 — "
                     f"레그 '{leg}' 이후는 건너뛰고 즉시 정지")
@@ -1123,7 +1135,7 @@ class ParkingNavigator(Node):
             self.send_goal(leg)
 
             while rclpy.ok() and not self._leg_done:
-                if self.get_clock().now().nanoseconds >= mission_deadline_ns:
+                if self._wall_clock.now().nanoseconds >= mission_deadline_ns:
                     self.get_logger().error(
                         f"전체 미션 제한시간({mission_deadline_sec:.0f}초) 초과 — "
                         f"레그 '{leg}' 강제 종료")
