@@ -125,7 +125,9 @@ class ParkingNavigator(Node):
         # [2026-08-24] 진입 웨이포인트 세분화(21개) 이후, 초반 좁은 지점 정체(후진
         # 반복)만으로도 예산의 상당 부분을 쓰고 마지막 한 세그먼트(0.22m) 남기고
         # 타임아웃되는 게 실측 확인됨 — 75초로 재상향.
-        self.declare_parameter('corridor_bypass_timeout_sec', 75.0)
+        # [2026-08-24, 대회 전날] 목표 코앞까지 데드레커닝을 확장(24개 웨이포인트)
+        # 하면서 110초로 재상향(mission_deadline_sec=170s 안에서 여전히 여유).
+        self.declare_parameter('corridor_bypass_timeout_sec', 110.0)
 
         # ── 목표 근처 전용 "정밀 접근"(docking) — 2026-08-20 ──
         #   README §6-2/§6-4에 이미 적혀있던 문제: 주차 목표가 벽에서 0.5m 안쪽이라
@@ -162,7 +164,12 @@ class ParkingNavigator(Node):
         # "도킹 없이 순수 Nav2"를 테스트해본 적은 없었으므로, 그 구간까지 Nav2가
         # 담당하도록 반경을 0.6m로 대폭 축소 — 도킹은 목표 바로 앞(벽까지 10cm 안팎이라
         # costmap이 원천적으로 계획 불가능한) 마지막 구간만 커버하게 한다.
-        self.declare_parameter('final_approach_radius', 0.6)
+        # [2026-08-24, 대회 전날] 0.6m로는 병목구간 데드레커닝 종료 지점이 반경 밖이라
+        # 매번 Nav2를 거쳐야 했고, 그 사이 Nav2의 spin/backup 복구가 헤딩을 100도+
+        # 스크램블시키는 게 반복 재현됨 — 병목구간 직후 헤딩은 항상 깨끗하므로,
+        # Nav2를 아예 안 거치고 그 상태 그대로 도킹에 넘기도록 1.2m로 상향
+        # (run()의 skip_nav2 로직과 짝).
+        self.declare_parameter('final_approach_radius', 1.2)
         self.declare_parameter('final_approach_speed', 0.35)
         # nav2_params.yaml의 goal_checker(xy_goal_tolerance/yaw_goal_tolerance)와
         # 동일 값을 기본값으로 두되, 이 노드만 따로 튜닝할 수 있게 별도 파라미터로 뺌.
@@ -172,7 +179,9 @@ class ParkingNavigator(Node):
         # 커버해야 하므로, 그만큼 시간 여유도 같이 늘림(대략 2.5m/0.15m/s ≈ 17s +
         # 헤딩보정 여유). [2026-08-24] 3분 예산을 3개 레그가 나눠 써야 해서 40→20초로
         # 축소 — 후진(K턴) 복원으로 큰 헤딩오차도 더 빨리 좁힐 수 있어 여유 있게 줄임.
-        self.declare_parameter('docking_timeout_sec', 20.0)
+        # [2026-08-24, 대회 전날] 20초로는 큰 헤딩오차를 못 풀고 타임아웃되는 게
+        # 반복 재현돼 35초로 상향.
+        self.declare_parameter('docking_timeout_sec', 35.0)
         self.declare_parameter('docking_yaw_kp', 1.5)
 
         # [2026-08-24] 전체 미션(출발→A→B→출발복귀) 소프트 데드라인. 경기 규정 제한시간
@@ -716,6 +725,17 @@ class ParkingNavigator(Node):
             # 기준으로 "Starting point in lethal space"였다. 지도 조회로 주변
             # 후보들의 clearance를 비교해 가장 여유로운 지점으로 교체.
             (0.90, 4.00),
+            # [2026-08-24, 대회 전날] 도킹(코스트맵 미사용, 장애물 인식 전혀 없음)이
+            # (0.90,4.00)에서 목표(0,4.2)까지 헤딩오차 큰(90도+) 상태로 한 번에 크게
+            # 휘어 돌다가, 그 방향에 있던 진짜 좁은 포켓(x≈1.1~1.3,y≈3.6~3.7,
+            # clearance 0.10~0.20m — 지도로 확인)에 완전히 박혀 11초+ 정지하는 게
+            # 실측 재현됨. distance_transform으로 목표까지 안전한(clearance
+            # 0.35m+) 경로를 확인해 데드레커닝으로 목표 바로 코앞까지 밀어붙이고,
+            # 도킹은 마지막 짧은 직선(약 0.14m, 헤딩도 이미 거의 맞음)만 담당하게
+            # 축소한다.
+            (0.60, 4.05),
+            (0.30, 4.10),
+            (0.10, 4.15),
         ],
     }
     # [2026-08-24] 세그먼트가 전부 짧고(0.20m 간격) 촘촘한 중심선이라, 앞부분 몇 개만
@@ -723,7 +743,7 @@ class ParkingNavigator(Node):
     # 기준(0.20m)으로 통일 — 짧은 구간에서 느슨한 허용오차(0.45m 이상)를 쓰면
     # 다음 세그먼트를 시작하기도 전에 이미 "도달"로 오판될 수 있다.
     ROUTE_BYPASS_NARROW_COUNT = {
-        ('START', 'A'): 20,  # 마지막(0.90,4.00) 제외 전부(진입정렬 4개 이후부터, +4는 위 세분화분)
+        ('START', 'A'): 23,  # 마지막(0.10,4.15) 제외 전부(진입정렬 4개 이후부터)
     }
     # [2026-08-24] 시작점~(1.05,1.15) 사이 새로 추가한 중간점 3개 + 기존 진입각
     # 보정 지점(1.05,1.15) = 4개는 전부 열린 공간(위 ROUTE_BYPASS_CENTERLINE 주석
@@ -745,7 +765,7 @@ class ParkingNavigator(Node):
     # 데드레커닝으로 밀고, Nav2에 넘기기 직전 딱 한 번만(idx==dr_n, 곧 마지막
     # 웨이포인트) 재정렬한다 — AMCL은 그 순간에만 신뢰.
     ROUTE_BYPASS_DR_COUNT = {
-        ('START', 'A'): 20,  # 마지막 웨이포인트(idx20, 0.90,4.00) 직전까지 전부 DR
+        ('START', 'A'): 23,  # 마지막 웨이포인트(idx23, 0.10,4.15) 직전까지 전부 DR
     }
 
     def _run_route_bypass(self, from_leg: str, to_leg: str):
@@ -995,15 +1015,21 @@ class ParkingNavigator(Node):
         # [2026-08-22] target_heading 모드(점 추종 vs 고정 goal_yaw)를 매 틱 "현재" 거리로
         # 재판정하던 것을 도킹 진입 시점 1회로 고정. 이 근접 거리대의 점 추종 베어링은
         # 위치가 조금만 바뀌어도 100도 이상 요동치는 게 실측돼 있어서(아래
-        # _docking_arc_control 근처 주석 참고), final_approach_radius(도킹 진입 문턱) <
-        # close_radius(항상 +0.05m 이상 크게 설계됨)이므로 도킹 진입 순간엔 항상 "고정
-        # goal_yaw" 조건을 만족한다 — 이 판정을 진입 시점에 굳혀서, 이후 일시적으로
-        # 멀어져도 점 추종으로 되돌아가지 않게 한다.
+        # _docking_arc_control 근처 주석 참고) 아주 가까울 때만 고정 goal_yaw를 쓴다.
+        # [2026-08-24, 대회 전날] close_radius가 final_approach_radius(도킹 진입
+        # 문턱)에 묶여 있었던 게 심각한 버그였다 — final_approach_radius를 1.2m로
+        # 올리자 도킹 진입 즉시(최대 1.2m 거리에서도) "고정 goal_yaw" 모드가 되어,
+        # 목표 "위치"는 완전히 무시하고 최종 방향(0도)만 맞추려 하다가 dist가 계속
+        # 커지며(0.45m -> 1.36m) 엉뚱한 데로 가는 게 실측 재현됨. 점 추종(목표 지점
+        # 방향)은 이제 이 거리대(원래 문제였던 0.15m 근방보다 훨씬 멂)에서는
+        # 요동 문제가 없으므로, close_radius를 final_approach_radius와 분리해
+        # 작은 고정값으로 되돌린다 — 정말 목표 코앞(0.3m)에 왔을 때만 고정
+        # goal_yaw로 전환.
         cx0, cy0, _ = self._cur_pose
         gx0, gy0, _ = self._goal_pose
         entry_dist = math.hypot(gx0 - cx0, gy0 - cy0)
         xy_tol = self.get_parameter('docking_xy_tolerance').value
-        close_radius = max(xy_tol * 3.0, self.get_parameter('final_approach_radius').value + 0.05)
+        close_radius = max(xy_tol * 3.0, 0.3)
         self._docking_use_fixed_heading = entry_dist <= close_radius
 
         self._docking_timer = self.create_timer(0.1, self._docking_control_loop)
@@ -1022,6 +1048,11 @@ class ParkingNavigator(Node):
         if dist <= xy_tol and abs(yaw_err_to_goal) <= yaw_tol:
             self._finish_docking(success=True)
             return
+
+        self.get_logger().info(
+            f'[진단] 도킹 cur=({cx:.2f},{cy:.2f},{math.degrees(cyaw):.0f}deg) dist={dist:.2f} '
+            f'헤딩오차={math.degrees(yaw_err_to_goal):.0f}deg',
+            throttle_duration_sec=0.5)
 
         now_ns = self._wall_clock.now().nanoseconds
         if now_ns >= self._docking_deadline:
@@ -1146,69 +1177,26 @@ class ParkingNavigator(Node):
         self._last_direct_angular_z = new_angular
         return new_angular
 
-    # [2026-08-24] 헤딩오차가 이 이상이면 K턴(후진 포함) 모드로 진입, 이 이하로 줄면
-    # 전진 원호 모드로 복귀한다. 두 값 사이 히스테리시스를 둬서 경계 근방에서 매 틱
-    # 모드가 왔다갔다 하는 걸 막는다(과거 point-tracking bearing 요동으로 dir_sign이
-    # 매번 뒤집히던 것과 같은 종류의 문제 재발 방지).
-    K_TURN_ENTER_RAD = math.radians(70)
-    K_TURN_EXIT_RAD = math.radians(45)
-
     def _docking_arc_control(self, heading_err, dist):
-        """헤딩오차 크기에 따라 전진 원호 제어(작을 때)와 K턴(클 때, 후진 포함)을
-        분기한다 — 2026-08-24, 후진 허용 확인에 따라 K턴 복원."""
-        if not self._docking_k_turn_active and abs(heading_err) > self.K_TURN_ENTER_RAD:
-            self._docking_k_turn_active = True
-            self._docking_k_turn_dir_sign = 1.0 if heading_err > 0 else -1.0
-            self._docking_k_turn_phase_direction = 1.0
-            self._docking_k_turn_phase_deadline_ns = None  # 아래에서 즉시 phase 시작
+        """[2026-08-24, 대회 전날 폐기] phase 전환식 K턴 상태머신을 썼었는데,
+        실측 결과 여러 번(174도/158도/152도/100도 헤딩오차 사례) 수렴하지 않고
+        헤딩오차가 그대로거나 오히려 dist가 늘어나는 것까지 확인됨(원인 미규명,
+        시간 부족으로 더 못 팜) — 병목구간 데드레커닝 주행에서 이미 널리 검증된
+        단순 방식으로 교체: 헤딩오차가 90도 이내면 전진, 넘으면(뒤쪽이 목표에 더
+        가까운 방향이므로) 후진을 선택해 그쪽 기준 오차로 동일한 P제어를 쓴다.
+        상태(진입/이탈 문턱, phase 타이머) 자체가 없어 오작동할 여지가 준다."""
+        if abs(heading_err) <= math.pi / 2:
+            direction = 1.0
+            steer_err = heading_err
+        else:
+            direction = -1.0
+            steer_err = normalize_angle(heading_err - math.pi)
+        return self._docking_forward_arc_control(direction, steer_err, dist)
 
-        if self._docking_k_turn_active:
-            if abs(heading_err) <= self.K_TURN_EXIT_RAD:
-                self._docking_k_turn_active = False
-            else:
-                return self._docking_k_turn_control()
-
-        return self._docking_forward_arc_control(heading_err, dist)
-
-    def _docking_k_turn_control(self):
-        """K턴 한 phase를 실행 — dir_sign(조향 방향)은 K턴 진입 시 1회 고정되고
-        (_docking_arc_control 참고), phase_direction(+1=전진/-1=후진)만 K_TURN_PHASE_SEC
-        마다 뒤집힌다. 전진 phase에는 dir_sign 쪽으로, 후진 phase에는 그 반대쪽으로
-        조향해야 두 phase가 서로 상쇄되지 않고 같은 방향 회전이 누적된다 — 실제 K턴
-        주차(예: 전진-좌 다음 후진-우를 해야 좌회전이 쌓인다)와 동일한 원리."""
-        K_TURN_PHASE_SEC = 1.0
-        K_TURN_SPEED = 0.15
-        MIN_SAFE_RADIUS_M = 0.25
-
-        now_ns = self._wall_clock.now().nanoseconds
-        if (self._docking_k_turn_phase_deadline_ns is None
-                or now_ns >= self._docking_k_turn_phase_deadline_ns):
-            self._docking_k_turn_phase_direction *= -1.0
-            self._docking_k_turn_phase_deadline_ns = now_ns + int(K_TURN_PHASE_SEC * 1e9)
-
-        direction = self._docking_k_turn_phase_direction
-        steer_sign = (self._docking_k_turn_dir_sign if direction > 0
-                      else -self._docking_k_turn_dir_sign)
-
-        target_speed = direction * self._front_safety_speed_cap(K_TURN_SPEED, direction)
-        speed = self._ramp_linear_speed(target_speed)
-
-        max_angular = K_TURN_SPEED / MIN_SAFE_RADIUS_M
-        angular_z = steer_sign * max_angular
-        angular_z += self._lidar_steer_bias(direction)
-        angular_z = self._ramp_angular_speed(angular_z)
-
-        cmd = Twist()
-        cmd.linear.x = speed
-        cmd.angular.z = angular_z
-        return cmd
-
-    def _docking_forward_arc_control(self, heading_err, dist):
-        """전진 + 원호 P제어로 헤딩을 맞춘다 — 헤딩오차가 K_TURN_ENTER_RAD 이하일
-        때만 호출됨(그보다 크면 _docking_k_turn_control이 담당)."""
-        direction = 1.0
-        steer_err = heading_err
-
+    def _docking_forward_arc_control(self, direction, steer_err, dist):
+        """전진(direction=1) 또는 후진(direction=-1) + 원호 P제어로 헤딩을 맞춘다
+        — 어느 쪽을 쓸지와 그 방향 기준 오차(steer_err)는 _docking_arc_control이
+        정한다."""
         kp = self.get_parameter('docking_yaw_kp').value
         approach_speed = self.get_parameter('final_approach_speed').value
         speed = max(approach_speed * 0.4, min(approach_speed, dist * 0.6))
@@ -1319,9 +1307,44 @@ class ParkingNavigator(Node):
             # Nav2에 목표를 보내기 전에, 이 구간에 알려진 병목이 있으면 먼저 직접
             # 통과시킨다(위 ROUTE_BYPASS_CENTERLINE 참고, 없으면 즉시 반환).
             self._run_route_bypass(prev_leg, leg)
+            # [2026-08-24, 대회 전날] _run_route_bypass가 타임아웃으로 일찍 끝나면
+            # (공유 웨이포인트 idx==dr_n에 못 도달) 내부 재정렬이 한 번도 안 일어난
+            # 채로 반환될 수 있다 — 그 상태의 self._cur_pose(AMCL)는 이 구간에서
+            # 반복 확인된 국소함정 때문에 신뢰 불가(실측: 실제로는 병목 끝 근처인데
+            # 3m+ 떨어진 엉뚱한 곳으로 보고됨). 아래 skip_nav2 판단이 이 잘못된
+            # 값을 근거로 삼지 않도록, 데드레커닝 앵커가 있으면(=이 구간이 실제로
+            # DR로 진행됐으면) 여기서도 한 번 더 강제 재정렬한다.
+            if self._dr_anchor is not None:
+                rx, ry, ryaw = self._dr_pose()
+                self._resync_amcl_to(rx, ry, ryaw, timeout_sec=4.0)
 
             self._retry_count = 0
-            self.send_goal(leg)
+            # [2026-08-24, 대회 전날] 병목 통과 직후 AMCL이 정확해도(재정렬로 확인됨)
+            # Nav2의 global_costmap이 "Starting point in lethal space"로 반복
+            # 오판하고, 그 복구용 BackUp이 좁은 통로를 거슬러 몇 미터씩 밀어내는
+            # 사고가 실측 재현됨 — 병목 통과 직후 위치가 이미 도킹 진입 반경
+            # (final_approach_radius) 안이면, Nav2(costmap 기반) 자체를 건너뛰고
+            # 바로 도킹(AMCL 피드백 직접제어, costmap 미사용이라 이 문제 자체가
+            # 없음)으로 들어간다.
+            goal_x, goal_y, goal_yaw = self._leg_pose(leg)
+            skip_nav2 = False
+            if self._cur_pose is not None:
+                cx, cy, _ = self._cur_pose
+                dist_to_goal = math.hypot(goal_x - cx, goal_y - cy)
+                if dist_to_goal <= self.get_parameter('final_approach_radius').value:
+                    skip_nav2 = True
+            if skip_nav2:
+                self.get_logger().info(
+                    f'병목 통과 직후 이미 도킹 반경 안(남은거리={dist_to_goal:.2f}m) — '
+                    f'Nav2 건너뛰고 바로 정밀 접근으로 진입')
+                self._current_leg = leg.upper()
+                self._leg_done = False
+                self._leg_success = False
+                self._docking_active = False
+                self._goal_pose = (goal_x, goal_y, goal_yaw)
+                self._start_docking()
+            else:
+                self.send_goal(leg)
 
             while rclpy.ok() and not self._leg_done:
                 if self._wall_clock.now().nanoseconds >= mission_deadline_ns:
