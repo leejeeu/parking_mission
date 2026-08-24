@@ -9,6 +9,7 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReli
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
 # [2026-08-20] 초음파(sensor_msgs/Range) 안전장치를 붙였다가 완전히 걷어냈다 — 범퍼
@@ -101,10 +102,13 @@ class ParkingNavigator(Node):
         #   아직 없음 — 시뮬레이션에서 같은 증상이 재현되면 그때 추가할 것.
         self.declare_parameter('corridor_bypass_enable', True)
         self.declare_parameter('corridor_bypass_xy_tolerance', 0.15)
-        self.declare_parameter('corridor_bypass_speed', 0.35)
+        self.declare_parameter('corridor_bypass_speed', 0.45)
         # [2026-08-24] 3분(180초) 안에 A/B 주차 + 출발지 복귀까지 전부 마쳐야 하는
-        # 제약이 생겨서(과거엔 구역 하나만 가면 끝이라 여유로웠음) 30초 → 15초로 축소.
-        self.declare_parameter('corridor_bypass_timeout_sec', 15.0)
+        # 제약이 생겨서(과거엔 구역 하나만 가면 끝이라 여유로웠음) 30초 → 15초로 축소됐었으나,
+        # 실측 결과(데드레커닝 도입 후) 첫 웨이포인트 도달까지만 20초 넘게 걸리는 걸
+        # 확인해서 25초로 재상향 — 전체 미션 예산(mission_deadline_sec=170s) 안에서는
+        # 여전히 여유 있음(START->A 구간 하나만 이 정도 쓰고 나머지 레그는 병목이 없음).
+        self.declare_parameter('corridor_bypass_timeout_sec', 25.0)
 
         # ── 목표 근처 전용 "정밀 접근"(docking) — 2026-08-20 ──
         #   README §6-2/§6-4에 이미 적혀있던 문제: 주차 목표가 벽에서 0.5m 안쪽이라
@@ -142,7 +146,7 @@ class ParkingNavigator(Node):
         # 담당하도록 반경을 0.6m로 대폭 축소 — 도킹은 목표 바로 앞(벽까지 10cm 안팎이라
         # costmap이 원천적으로 계획 불가능한) 마지막 구간만 커버하게 한다.
         self.declare_parameter('final_approach_radius', 0.6)
-        self.declare_parameter('final_approach_speed', 0.30)
+        self.declare_parameter('final_approach_speed', 0.35)
         # nav2_params.yaml의 goal_checker(xy_goal_tolerance/yaw_goal_tolerance)와
         # 동일 값을 기본값으로 두되, 이 노드만 따로 튜닝할 수 있게 별도 파라미터로 뺌.
         self.declare_parameter('docking_xy_tolerance', 0.05)
@@ -219,6 +223,15 @@ class ParkingNavigator(Node):
         self.create_subscription(LaserScan, '/scan', self._cb_scan, 10)
         self._scan_msg = None
         self._cur_pose = None   # (x, y, yaw), _cb_amcl_pose가 계속 갱신
+        # [2026-08-24] START->A 병목구간(중앙기둥 남동쪽 모서리 근처, x~1.5/y~1.75)
+        # 전용 데드레커닝용. AMCL이 이 구간에서 실제 위치와 무관하게 그쪽으로 쏠리는
+        # 국소 함정(local trap)이 있는 걸 반복 재현으로 확인함(웨이포인트/조향가중치/
+        # 허용오차를 바꿔도 매번 같은 좌표로 수렴하거나 순간이동) — 스캔매칭 자체의
+        # 문제로 판단, 이 구간만은 AMCL을 안 쓰고 odom_publisher.py가 발행하는 /odom
+        # (VESC 속도 + IMU 요만 사용, 정확도 실측 확인됨)으로 상대이동만 추적한다.
+        self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
+        self._odom_msg = None
+        self._dr_anchor = None  # (map_x, map_y, odom_x, odom_y, yaw_offset) — 병목구간 진입 시 1회 설정
         self._goal_pose = None  # (x, y, yaw), send_goal()이 채움
         self._docking_active = False
         self._docking_timer = None
@@ -280,6 +293,49 @@ class ParkingNavigator(Node):
         # 노드 코드로 완전히 막을 수는 없고, 최소한 발생 빈도를 낮추기 위해 초음파
         # Range 구독(예외를 유발하던 원인)을 완전히 제거했다.
         self._maybe_start_docking()
+
+    def _cb_odom(self, msg: Odometry):
+        self._odom_msg = msg
+
+    def _odom_xyz(self):
+        """/odom(odom_publisher.py, VESC속도+IMU요 데드레커닝)에서 (x,y,yaw) 추출.
+        아직 못 받았으면 None."""
+        if self._odom_msg is None:
+            return None
+        p = self._odom_msg.pose.pose
+        return (p.position.x, p.position.y, quaternion_to_yaw(p.orientation))
+
+    def _dr_set_anchor(self):
+        """병목구간 진입 시 1회 호출 — 그 순간의 AMCL pose(신뢰 가능, 방금
+        publish_initial_pose_until_amcl_ready()로 확인된 직후)를 기준점으로 삼고,
+        같은 순간의 /odom 값과의 오프셋을 저장한다. 이후 _dr_pose()는 이 기준점 +
+        odom 상대이동만으로 위치를 추정해, 이 구간에서 반복 재현된 AMCL 국소 함정
+        (위 __init__ 주석 참고)의 영향을 받지 않는다."""
+        amcl = self._cur_pose
+        odom = self._odom_xyz()
+        if amcl is None or odom is None:
+            self._dr_anchor = None
+            return False
+        map_x, map_y, map_yaw = amcl
+        odom_x, odom_y, odom_yaw = odom
+        yaw_offset = normalize_angle(map_yaw - odom_yaw)
+        self._dr_anchor = (map_x, map_y, odom_x, odom_y, yaw_offset)
+        return True
+
+    def _dr_pose(self):
+        """데드레커닝 추정 pose(x,y,yaw) — _dr_set_anchor() 이후, 기준점에 odom
+        상대이동(기준시점 오프셋만큼 회전변환)을 더해서 계산. 앵커/odom 둘 다
+        없으면 AMCL(self._cur_pose)로 폴백(둘 다 못 받은 극초반 대비)."""
+        odom = self._odom_xyz()
+        if self._dr_anchor is None or odom is None:
+            return self._cur_pose
+        map_x0, map_y0, odom_x0, odom_y0, yaw_offset = self._dr_anchor
+        odom_x, odom_y, odom_yaw = odom
+        dx, dy = odom_x - odom_x0, odom_y - odom_y0
+        cos_o, sin_o = math.cos(yaw_offset), math.sin(yaw_offset)
+        map_dx = dx * cos_o - dy * sin_o
+        map_dy = dx * sin_o + dy * cos_o
+        return (map_x0 + map_dx, map_y0 + map_dy, normalize_angle(odom_yaw + yaw_offset))
 
     def _cb_scan(self, msg: LaserScan):
         self._scan_msg = msg
@@ -531,14 +587,33 @@ class ParkingNavigator(Node):
     # 실측 검증된 출발→A 구간뿐 — A→B/B→출발 구간은 이번에 처음 생기는 경로라 아직
     # 값이 없다(시뮬레이션에서 같은 "Starting point in lethal space" 증상이 재현되면
     # 그때 추가할 것, 아래 _run_route_bypass 참고).
+    # [2026-08-24] parking_map.pgm에 로봇 반경(0.30m) 팽창 후 Dijkstra 최단경로를
+    # 직접 계산해서 얻은 값으로 교체. 기존 (0.60,1.70)은 이 y구간(1.6~1.75)에서
+    # 서쪽 ㄱ자 걸쇠 벽 쪽으로 붙는 좌표라, 로봇 반경 기준으로 보면 계산상 안전한
+    # 통과지점(x≈0.95~1.00)보다 오히려 여유가 부족했다 — 실측으로 반복 재현된
+    # "병목에서 못 빠져나옴" 실패의 원인 중 하나였다. 맨 앞 (1.20,1.15)는 추가
+    # 진입각 보정용 — 지도 원본 해상도로 확인한 결과, 시작점(1.8,0.9)에서 바로
+    # (1.00,1.60)으로 조향하면 그 벽 모서리(약 x=1.3~1.45,y=1.70~1.85)를 스치듯
+    # 크게 도는 궤적이 나와 반복 재현됐다(웨이포인트/조향가중치/허용오차를 바꿔도
+    # 동일 지점에서 멈춤 — 튜닝으로 안 풀리는 기하학적 문제로 판단). 모서리에서
+    # 충분히 남쪽(clearance 0.585m)인 이 점을 먼저 거치게 해서, 모서리를 넓게 돈
+    # 뒤 이미 남쪽 열린 공간에 있는 상태에서 (1.00,1.60)로 짧게 북상하도록 유도한다.
     ROUTE_BYPASS_CENTERLINE = {
         ('START', 'A'): [
-            (0.60, 1.70),
-            (0.75, 2.10),
-            (0.95, 2.70),
-            (0.97, 3.40),
-            (0.95, 3.90),
+            (1.20, 1.15),
+            (1.00, 1.60),
+            (1.00, 1.70),
+            (0.95, 1.75),
+            (0.95, 3.55),
+            (1.00, 3.75),
         ],
+    }
+    # 위 리스트 중 앞부분(폭 0.7~1m 병목 통로 구간)만 도달판정을 타이트하게(0.20m)
+    # 잡는다 — 느슨한 0.45m를 쓰면 실제로는 벽에서 0.44m 옆(=거의 붙은 위치)에
+    # 있는데도 "도달"로 인정돼버려서, 다음 목표로 방향을 트는 순간 이미 붙어있던
+    # 벽에 눌리는 걸 지도 원본 해상도 조회로 실측 확인함(그 지점이 실제 벽 픽셀).
+    ROUTE_BYPASS_NARROW_COUNT = {
+        ('START', 'A'): 5,  # (0.95,3.55)까지 — 마지막 (1.00,3.75)는 넓은 구간이라 제외
     }
 
     def _run_route_bypass(self, from_leg: str, to_leg: str):
@@ -562,14 +637,19 @@ class ParkingNavigator(Node):
         speed_param = self.get_parameter('corridor_bypass_speed').value
         timeout_sec = self.get_parameter('corridor_bypass_timeout_sec').value
 
-        while self._cur_pose is None and rclpy.ok():
+        while (self._cur_pose is None or self._odom_msg is None) and rclpy.ok():
             self._spin_once_safe(timeout_sec=0.2)
         if self._cur_pose is None:
             return
 
-        cx0, cy0, _ = self._cur_pose
+        # [2026-08-24] 이 구간 전체는 AMCL이 아니라 데드레커닝(_dr_pose())으로
+        # 진행한다 — 위 __init__/_dr_set_anchor() 주석 참고. 여기서 딱 한 번 AMCL을
+        # 기준점으로 신뢰하고(방금 publish_initial_pose_until_amcl_ready()로 확인된
+        # 직후라 신뢰 가능), 이후로는 그 기준점 + odom 상대이동만 쓴다.
+        self._dr_set_anchor()
+        cx0, cy0, _ = self._dr_pose()
         self.get_logger().info(
-            f'병목 구간 우회 시작({from_leg}->{to_leg}) — 현재=({cx0:.2f},{cy0:.2f}), '
+            f'병목 구간 우회 시작(데드레커닝 기준, {from_leg}->{to_leg}) — 현재=({cx0:.2f},{cy0:.2f}), '
             f'중심선 웨이포인트 {len(waypoints)}개 통과 예정')
         self._last_direct_linear_x = 0.0
         self._last_direct_cmd_t_ns = None
@@ -579,10 +659,18 @@ class ParkingNavigator(Node):
         deadline = self.get_clock().now().nanoseconds + int(timeout_sec * 1e9)
         # 중간 지점은 "지나가기만" 하면 되므로 정밀 정지가 필요 없다 — xy_tol 그대로 쓰면
         # 근처에서 헤딩만 미세조정하느라 시간을 낭비할 수 있어 느슨하게(3배) 잡는다.
-        # 마지막 지점(final_wx/wy)만 원래 tolerance를 그대로 쓴다.
+        # 마지막 지점만 원래 tolerance를 그대로 쓴다. [2026-08-24] 단, 폭 0.7~1m
+        # 병목 통로 구간(ROUTE_BYPASS_NARROW_COUNT)만은 예외로 0.20m까지 좁힌다 —
+        # 위 ROUTE_BYPASS_CENTERLINE 주석의 "벽 픽셀 실측 확인" 참고.
+        narrow_n = self.ROUTE_BYPASS_NARROW_COUNT.get((from_leg.upper(), to_leg.upper()), 0)
         for idx, (wx, wy) in enumerate(waypoints):
             is_final = (idx == len(waypoints) - 1)
-            seg_tol = xy_tol if is_final else max(xy_tol * 3.0, 0.25)
+            if is_final:
+                seg_tol = xy_tol
+            elif idx < narrow_n:
+                seg_tol = max(xy_tol * 1.3, 0.20)
+            else:
+                seg_tol = max(xy_tol * 3.0, 0.25)
             reached = self._drive_corridor_segment(wx, wy, seg_tol, speed_param, deadline)
             if not reached:
                 return  # 타임아웃 — 남은 지점은 건너뛰고 Nav2로 넘어감(기존 정책과 동일)
@@ -591,8 +679,9 @@ class ParkingNavigator(Node):
     def _drive_corridor_segment(self, wx, wy, xy_tol, speed_param, deadline_ns) -> bool:
         """_run_route_bypass()의 한 웨이포인트 구간을 주행 — 도달하면 True, 공유
         deadline_ns를 넘기면 False를 반환한다(정지 감지+backoff 로직은 기존과 동일,
-        구간이 바뀔 때마다 진행추적 상태를 리셋한다)."""
-        progress_pose = self._cur_pose
+        구간이 바뀔 때마다 진행추적 상태를 리셋한다). [2026-08-24] 위치는 AMCL이
+        아니라 _dr_pose()(데드레커닝, _run_route_bypass 주석 참고)를 쓴다."""
+        progress_pose = self._dr_pose()
         progress_t = self.get_clock().now().nanoseconds
         backoff_until = None
         STUCK_MOVE_M = 0.03
@@ -610,9 +699,10 @@ class ParkingNavigator(Node):
 
         while rclpy.ok():
             self._spin_once_safe(timeout_sec=0.05)
-            if self._cur_pose is None:
+            dr = self._dr_pose()
+            if dr is None:
                 continue
-            cx, cy, cyaw = self._cur_pose
+            cx, cy, cyaw = dr
             dist = math.hypot(wx - cx, wy - cy)
             now_ns = self.get_clock().now().nanoseconds
 
@@ -627,7 +717,7 @@ class ParkingNavigator(Node):
 
             px, py, _ = progress_pose
             if math.hypot(cx - px, cy - py) >= STUCK_MOVE_M:
-                progress_pose = self._cur_pose
+                progress_pose = dr
                 progress_t = now_ns
             elif backoff_until is None and (now_ns - progress_t) / 1e9 >= STUCK_TIMEOUT_SEC:
                 self.get_logger().warn(
@@ -644,7 +734,7 @@ class ParkingNavigator(Node):
                     self._cmd_vel_pub.publish(cmd)
                     continue
                 backoff_until = None
-                progress_pose = self._cur_pose
+                progress_pose = self._dr_pose()
                 progress_t = now_ns
 
             heading_err = normalize_angle(math.atan2(wy - cy, wx - cx) - cyaw)
