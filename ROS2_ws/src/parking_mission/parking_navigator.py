@@ -122,7 +122,10 @@ class ParkingNavigator(Node):
         # 걸림)하고 마지막 긴 직선구간(0.95,3.55, 1.8m)까지 가는 데는 25초로도 부족한
         # 걸 실측 확인해서 45초로 재상향 — 전체 미션 예산(mission_deadline_sec=170s)
         # 안에서는 여전히 여유 있음(START->A 구간 하나만 이 정도 쓰고 나머지 레그는 병목이 없음).
-        self.declare_parameter('corridor_bypass_timeout_sec', 55.0)
+        # [2026-08-24] 진입 웨이포인트 세분화(21개) 이후, 초반 좁은 지점 정체(후진
+        # 반복)만으로도 예산의 상당 부분을 쓰고 마지막 한 세그먼트(0.22m) 남기고
+        # 타임아웃되는 게 실측 확인됨 — 75초로 재상향.
+        self.declare_parameter('corridor_bypass_timeout_sec', 75.0)
 
         # ── 목표 근처 전용 "정밀 접근"(docking) — 2026-08-20 ──
         #   README §6-2/§6-4에 이미 적혀있던 문제: 주차 목표가 벽에서 0.5m 안쪽이라
@@ -688,7 +691,19 @@ class ParkingNavigator(Node):
             (0.60, 1.75),   # 병목 진짜 중심선(가장 좁은 지점), 여유 0.70m대
             (0.68, 1.95),
             (0.78, 2.15),
-            (0.88, 2.35),
+            # [2026-08-24] (0.78,2.15)->(0.88,2.35) 한 세그먼트(0.22m)에서 실측으로
+            # 반복 재현된 충돌: 두 점 자체는 안전(clearance 0.46m/0.40m)하지만 실제
+            # 주행 궤적은 직선이 아니라 오른쪽으로 크게 휘어 x=1.3~1.4대까지 나갔다가
+            # 돌아오는 모양이 되고, 그 방향의 기둥 모서리(x=1.41,y=2.19 지점 clearance
+            # 0.00 — 지도 distance_transform으로 확인, 실제로 거기서 20초 넘게 완전히
+            # 정지)에 정통으로 부딪힘. distance_transform으로 이 구간(y=2.15~2.55) 중심선을
+            # 다시 촘촘히(±0.08m 창) 재계산해 5개 점으로 세분화 — 각 세그먼트가 0.1m
+            # 안팎이라 급하게 휘어 도는 궤적 자체가 나올 여지가 없다.
+            (0.83, 2.19),
+            (0.88, 2.23),
+            (0.88, 2.31),
+            (0.93, 2.39),
+            (0.93, 2.47),
             (0.93, 2.55),
             (0.93, 2.75),
             (0.93, 2.95),
@@ -708,7 +723,7 @@ class ParkingNavigator(Node):
     # 기준(0.20m)으로 통일 — 짧은 구간에서 느슨한 허용오차(0.45m 이상)를 쓰면
     # 다음 세그먼트를 시작하기도 전에 이미 "도달"로 오판될 수 있다.
     ROUTE_BYPASS_NARROW_COUNT = {
-        ('START', 'A'): 16,  # 마지막(0.90,4.00) 제외 전부(진입정렬 4개 이후부터)
+        ('START', 'A'): 20,  # 마지막(0.90,4.00) 제외 전부(진입정렬 4개 이후부터, +4는 위 세분화분)
     }
     # [2026-08-24] 시작점~(1.05,1.15) 사이 새로 추가한 중간점 3개 + 기존 진입각
     # 보정 지점(1.05,1.15) = 4개는 전부 열린 공간(위 ROUTE_BYPASS_CENTERLINE 주석
@@ -721,8 +736,16 @@ class ParkingNavigator(Node):
     # (0.68,1.95)까지)에만 있었다 — 그 이후(전환/직선구간)는 AMCL로 복귀해 데드레커닝
     # 순수적분 누적오차를 피한다(실측: 긴 구간 전체를 데드레커닝에 맡기면 Nav2 인계
     # 시점에 실제 위치와 최대 1m 어긋남 확인됨).
+    # [2026-08-24] dr_n=8(idx8에서 AMCL로 전환)로 두고 그 전환 시점에 재정렬까지
+    # 넣었는데도, 재정렬 직후 몇 틱 안에 AMCL이 다시 순간이동급 점프(0.5초 만에
+    # 0.6m/s 상당 이동 — 물리적으로 불가능)를 내는 게 실측 재현됨. idx8~idx19
+    # 구간(기둥 근처, x=0.8~1.4/y=2.0~2.6대) 자체가 라이다 기준 애매한 형상이라
+    # AMCL이 반복적으로 국소함정에 빠지는 것으로 판단 — 한 번의 재정렬로는
+    # 못 막는다. 그래서 이 구간 전체를 병목구간 끝(마지막 웨이포인트 직전)까지
+    # 데드레커닝으로 밀고, Nav2에 넘기기 직전 딱 한 번만(idx==dr_n, 곧 마지막
+    # 웨이포인트) 재정렬한다 — AMCL은 그 순간에만 신뢰.
     ROUTE_BYPASS_DR_COUNT = {
-        ('START', 'A'): 8,  # 새로 추가된 중간점 3개만큼 기존 5에서 +3
+        ('START', 'A'): 20,  # 마지막 웨이포인트(idx20, 0.90,4.00) 직전까지 전부 DR
     }
 
     def _run_route_bypass(self, from_leg: str, to_leg: str):
@@ -835,6 +858,12 @@ class ParkingNavigator(Node):
         # 대신 원호 제어를 여기서 직접 계산한다(_docking_arc_control과 동일 로직, 속도
         # 파라미터만 다름).
         kp = self.get_parameter('docking_yaw_kp').value
+        # [2026-08-24] 0.45로 올려봤다가(조향 상한 자체를 낮춤) 되돌림 — heading_err가
+        # 진짜 크게(백오프 직후 등) 벌어졌을 때 상한이 너무 낮아 못 돌고 그대로
+        # 직진하며 코스를 완전히 벗어나는 실측 재현(-118도까지 계속 악화). 상한은
+        # 원래대로, 대신 아래 _ramp_angular_speed의 max_alpha만 낮춰서 "그 상한까지
+        # 도달하는 속도"만 완만하게 한다 — 큰 회전 자체는 여전히 가능하되 확 꺾이진
+        # 않음.
         MIN_SAFE_RADIUS_M = 0.25
 
         while rclpy.ok():
@@ -878,7 +907,13 @@ class ParkingNavigator(Node):
                 progress_t = now_ns
 
             heading_err = normalize_angle(math.atan2(wy - cy, wx - cx) - cyaw)
-            speed = max(speed_param * 0.4, min(speed_param, dist * 0.6))
+            # [2026-08-24] 세분화된 웨이포인트(~0.2m 간격)라 dist가 거의 항상 작아
+            # dist*0.6 항이 대부분 구간에서 speed_param(0.45) 자체보다 계속 낮게
+            # 눌러버림 — corridor_bypass_speed를 올려도 체감 속도가 거의 안 변하는
+            # 원인. 조향은 이제 램프(_ramp_angular_speed max_alpha=1.2)로 안정화됐으니
+            # 하한(바닥)만 0.4->0.55로 올려 이 짧은 세그먼트 구간도 더 빠르게 지나가게
+            # 한다(사용자 요청 — 조향이 안정된 지금은 속도를 더 줘도 될 것으로 판단).
+            speed = max(speed_param * 0.55, min(speed_param, dist * 0.6))
             speed = self._front_safety_speed_cap(speed, 1.0)
             speed = self._ramp_linear_speed(speed)
             # [2026-08-24] max_angular = speed/MIN_SAFE_RADIUS_M라서 속도를 올릴수록
@@ -913,7 +948,10 @@ class ParkingNavigator(Node):
                 f'angular_z(clamp전)={angular_z:.2f} max_angular={max_angular:.2f}',
                 throttle_duration_sec=0.5)
             angular_z = max(-max_angular, min(max_angular, angular_z))
-            angular_z = self._ramp_angular_speed(angular_z)
+            # [2026-08-24] 기본 max_alpha(2.5rad/s^2)로도 사용자가 시뮬레이션에서
+            # "조향이 확 꺾인다"고 느낄 만큼 빠르게 램프업됨 — 병목구간 전용으로 더
+            # 낮춰(1.2) 목표 각속도가 같아도 거기 도달하는 속도 자체를 늦춘다.
+            angular_z = self._ramp_angular_speed(angular_z, max_alpha=1.2)
 
             cmd = Twist()
             cmd.linear.x = speed
