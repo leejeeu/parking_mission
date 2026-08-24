@@ -440,10 +440,17 @@ class ParkingNavigator(Node):
         ratio = (front_clear - FRONT_SAFETY_MARGIN_M) / (FRONT_SLOWDOWN_RANGE_M - FRONT_SAFETY_MARGIN_M)
         return nominal_speed * ratio
 
-    def publish_initial_pose(self):
-        x = self.get_parameter('start_x').value
-        y = self.get_parameter('start_y').value
-        yaw = self.get_parameter('start_yaw').value
+    def publish_initial_pose(self, x=None, y=None, yaw=None):
+        """x/y/yaw을 안 주면 미션 시작점(start_x/y/yaw 파라미터)을 쓴다 — 기존
+        호출부(미션 시작 시 1회) 그대로 호환. [2026-08-24] 병목구간 데드레커닝->AMCL
+        전환 시점에 임의의 위치로 재정렬시키기 위해 인자를 받도록 일반화(아래
+        _run_route_bypass 참고)."""
+        if x is None:
+            x = self.get_parameter('start_x').value
+        if y is None:
+            y = self.get_parameter('start_y').value
+        if yaw is None:
+            yaw = self.get_parameter('start_yaw').value
         qx, qy, qz, qw = yaw_to_quaternion(yaw)
 
         msg = PoseWithCovarianceStamped()
@@ -504,6 +511,43 @@ class ParkingNavigator(Node):
             self.get_logger().warn(
                 f'/amcl_pose를 {timeout_sec:.0f}초 안에 못 받음 — 그래도 목표 전송 시도')
         return received
+
+    def _resync_amcl_to(self, x, y, yaw, timeout_sec):
+        """[2026-08-24] 병목구간을 데드레커닝(_dr_pose)으로 통과하는 동안, AMCL 자체는
+        (제어에 안 쓰일 뿐) 계속 라이다로 자체 추정을 갱신하고 있는데 — 좁은 통로+기둥
+        근처의 대칭적 형상 때문에 실측으로 여러 번 확인된 "AMCL 국소함정"(전혀 다른
+        위치로 잘못 수렴)에 빠진 채로 있는 경우가 있다. 그 상태에서 idx>=dr_n(AMCL
+        신뢰 전환)에 도달하면, 신뢰할 수 있었던 데드레커닝 대신 이미 틀어진 AMCL을
+        그대로 넘겨받아 dist/heading_err가 1m+로 튀고 그 자리에서 헛돌다 타임아웃 →
+        Nav2가 "Starting point in lethal space"로 못 뜨는 연쇄 실패가 실측 재현됨.
+        publish_initial_pose_until_amcl_ready()와 같은 방식(RViz 2D Pose Estimate
+        재현)으로, 신뢰할 수 있는 데드레커닝 추정치를 /initialpose로 주기 재발행해
+        AMCL 파티클을 강제로 그 근방에 재수렴시킨다 — 단발 발행 대신 실제
+        self._cur_pose가 그 근방에 도달했는지(수렴 확인)까지 기다리는 점이
+        publish_initial_pose_until_amcl_ready()와 다르다(그쪽은 최초 기동 시
+        self._cur_pose가 아예 None이라 '아무 값이나 옴'만 확인하면 충분했음)."""
+        CONVERGE_TOL_M = 0.35
+        deadline = self._wall_clock.now().nanoseconds + int(timeout_sec * 1e9)
+        republish_period_sec = 1.0
+        next_republish = self._wall_clock.now().nanoseconds
+
+        self.publish_initial_pose(x, y, yaw)
+        while rclpy.ok() and self._wall_clock.now().nanoseconds < deadline:
+            self._spin_once_safe(timeout_sec=0.2)
+            if self._cur_pose is not None:
+                cx, cy, _ = self._cur_pose
+                if math.hypot(cx - x, cy - y) <= CONVERGE_TOL_M:
+                    self.get_logger().info(
+                        f'AMCL 재정렬 완료 — 데드레커닝 기준({x:.2f},{y:.2f}) 근방({cx:.2f},{cy:.2f})으로 수렴')
+                    return True
+            now_ns = self._wall_clock.now().nanoseconds
+            if now_ns >= next_republish:
+                self.publish_initial_pose(x, y, yaw)
+                next_republish = now_ns + int(republish_period_sec * 1e9)
+        self.get_logger().warn(
+            f'AMCL 재정렬 타임아웃({timeout_sec:.0f}초) — 데드레커닝 기준({x:.2f},{y:.2f})으로 '
+            f'수렴 확인 못 함, 그래도 계속 진행')
+        return False
 
     def send_goal(self, leg: str):
         """레그(leg) 하나의 Nav2 목표를 전송한다. 다중 레그 미션(run() 참고)에서 매
@@ -627,8 +671,17 @@ class ParkingNavigator(Node):
     # 문제 자체가 구조적으로 안 생긴다. 중심선 탐색은 "이전 지점 ±0.15m 근방"으로만
     # 제한해서(넓게 잡으면 서쪽 완전히 다른 개활지로 새는 걸 확인함) 경로 연속성을
     # 보장했다.
+    # [2026-08-24] 시작점(1.80,0.90)->(1.05,1.15) 구간(0.79m)이 나머지 세그먼트(전부
+    # ~0.20m 간격)보다 4배 가까이 길어서, 위와 동일한 "긴 세그먼트에서 조향이
+    # 못 따라잡고 벽을 스친다" 문제가 실행 시작 직후(사용자 확인, Gazebo 실측)
+    # 재현됨 — 같은 해법(0.20m 간격 리샘플링)으로 이 구간도 직선상에 중간점
+    # 3개를 추가로 끼워넣는다(시작점~(1.05,1.15) 구간은 열린 공간이라 직선
+    # 보간으로 충분, distance_transform 재계산 불필요).
     ROUTE_BYPASS_CENTERLINE = {
         ('START', 'A'): [
+            (1.61, 0.96),
+            (1.42, 1.03),
+            (1.24, 1.09),
             (1.05, 1.15),
             (0.90, 1.35),
             (0.75, 1.55),
@@ -655,14 +708,21 @@ class ParkingNavigator(Node):
     # 기준(0.20m)으로 통일 — 짧은 구간에서 느슨한 허용오차(0.45m 이상)를 쓰면
     # 다음 세그먼트를 시작하기도 전에 이미 "도달"로 오판될 수 있다.
     ROUTE_BYPASS_NARROW_COUNT = {
-        ('START', 'A'): 13,  # 마지막(0.90,4.00) 제외 전부
+        ('START', 'A'): 16,  # 마지막(0.90,4.00) 제외 전부(진입정렬 4개 이후부터)
+    }
+    # [2026-08-24] 시작점~(1.05,1.15) 사이 새로 추가한 중간점 3개 + 기존 진입각
+    # 보정 지점(1.05,1.15) = 4개는 전부 열린 공간(위 ROUTE_BYPASS_CENTERLINE 주석
+    # 참고) — 타이트한 허용오차를 주면 idx==0에서 겪었던 것과 같은 맴돌이가
+    # 재현될 수 있어 이 4개 전부 느슨한 허용오차를 쓴다.
+    ROUTE_BYPASS_ENTRY_COUNT = {
+        ('START', 'A'): 4,
     }
     # [2026-08-24] AMCL 국소함정은 병목 진입~진짜 병목 통과 직후(idx 0~4,
     # (0.68,1.95)까지)에만 있었다 — 그 이후(전환/직선구간)는 AMCL로 복귀해 데드레커닝
     # 순수적분 누적오차를 피한다(실측: 긴 구간 전체를 데드레커닝에 맡기면 Nav2 인계
     # 시점에 실제 위치와 최대 1m 어긋남 확인됨).
     ROUTE_BYPASS_DR_COUNT = {
-        ('START', 'A'): 5,
+        ('START', 'A'): 8,  # 새로 추가된 중간점 3개만큼 기존 5에서 +3
     }
 
     def _run_route_bypass(self, from_leg: str, to_leg: str):
@@ -713,17 +773,20 @@ class ParkingNavigator(Node):
         # 위 ROUTE_BYPASS_CENTERLINE 주석의 "벽 픽셀 실측 확인" 참고.
         narrow_n = self.ROUTE_BYPASS_NARROW_COUNT.get((from_leg.upper(), to_leg.upper()), 0)
         dr_n = self.ROUTE_BYPASS_DR_COUNT.get((from_leg.upper(), to_leg.upper()), 0)
+        # [2026-08-24] 원래 "idx==0만 느슨"이었는데, 시작점 근처에 열린 공간
+        # 진입정렬 웨이포인트가 여러 개(entry_n개) 있는 구간도 생겨서 일반화.
+        entry_n = self.ROUTE_BYPASS_ENTRY_COUNT.get((from_leg.upper(), to_leg.upper()), 1)
         for idx, (wx, wy) in enumerate(waypoints):
             is_final = (idx == len(waypoints) - 1)
             if is_final:
                 seg_tol = xy_tol
-            elif idx == 0:
-                # [2026-08-24] 맨 앞 진입각 보정 지점(1.20,1.15)은 실제 장애물까지
+            elif idx < entry_n:
+                # [2026-08-24] 맨 앞 진입각 보정 지점(들)은 실제 장애물까지
                 # 0.585m 여유가 있는 완전히 열린 공간이다(지도 조회로 확인) — 그런데
                 # 타이트한 허용오차(0.20m)를 적용했더니 차가 0.20~0.21m 경계에서
                 # 못 넘어가고 계속 맴돌아, 여기서만 14초(전체 25초 예산의 절반 이상)를
-                # 날리는 걸 실측 확인함. 이 지점은 좁은 통로가 아니라 사전 정렬용
-                # 여유공간이라 느슨한 허용오차로 되돌린다 — 진짜 좁은 구간(idx>=1)만
+                # 날리는 걸 실측 확인함. 이 지점들은 좁은 통로가 아니라 사전 정렬용
+                # 여유공간이라 느슨한 허용오차로 되돌린다 — 진짜 좁은 구간(idx>=entry_n)만
                 # 타이트하게 유지.
                 seg_tol = max(xy_tol * 3.0, 0.25)
             elif idx < narrow_n:
@@ -738,6 +801,13 @@ class ParkingNavigator(Node):
             # narrow_n 구간(병목 진입~통과 직후)에만 있었으므로, 그 이후(먼 직선구간)는
             # 다시 AMCL을 신뢰해 누적오차를 원천 차단한다.
             use_dr = idx < dr_n
+            # [2026-08-24] idx==dr_n(막 DR에서 AMCL로 넘어가는 바로 그 지점)에서,
+            # 넘겨받을 AMCL이 "국소함정"에 빠져 있으면 이 시점 그대로 dist/heading_err가
+            # 크게 튀는 게 실측 확인됨(위 _resync_amcl_to 주석 참고) — 넘어가기 직전
+            # 신뢰할 수 있는 데드레커닝 추정치로 AMCL을 강제 재정렬시켜 이 점프를 막는다.
+            if idx == dr_n and dr_n > 0:
+                rx, ry, ryaw = self._dr_pose()
+                self._resync_amcl_to(rx, ry, ryaw, timeout_sec=4.0)
             reached = self._drive_corridor_segment(wx, wy, seg_tol, speed_param, deadline, use_dr=use_dr)
             if not reached:
                 return  # 타임아웃 — 남은 지점은 건너뛰고 Nav2로 넘어감(기존 정책과 동일)
