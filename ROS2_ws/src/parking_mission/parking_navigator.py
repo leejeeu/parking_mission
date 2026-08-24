@@ -246,6 +246,10 @@ class ParkingNavigator(Node):
         self.create_subscription(Odometry, '/odom', self._cb_odom, 10)
         self._odom_msg = None
         self._dr_anchor = None  # (map_x, map_y, odom_x, odom_y, yaw_offset) — 병목구간 진입 시 1회 설정
+        # [2026-08-25] AMCL 게이트 보정("순수 데드레커닝 대신 AMCL을 완전히 버리지
+        # 않는" 절충안) — _dr_gated_correct() 참고. 병목구간 재진입마다(_dr_set_anchor)
+        # 리셋해서, 이전 레그의 마지막 보정 시각이 새 구간 초반 보정을 막지 않게 한다.
+        self._last_dr_correct_t_ns = None
         self._goal_pose = None  # (x, y, yaw), send_goal()이 채움
         self._docking_active = False
         self._docking_timer = None
@@ -334,6 +338,7 @@ class ParkingNavigator(Node):
         odom_x, odom_y, odom_yaw = odom
         yaw_offset = normalize_angle(map_yaw - odom_yaw)
         self._dr_anchor = (map_x, map_y, odom_x, odom_y, yaw_offset)
+        self._last_dr_correct_t_ns = None
         return True
 
     def _dr_pose(self):
@@ -350,6 +355,58 @@ class ParkingNavigator(Node):
         map_dx = dx * cos_o - dy * sin_o
         map_dy = dx * sin_o + dy * cos_o
         return (map_x0 + map_dx, map_y0 + map_dy, normalize_angle(odom_yaw + yaw_offset))
+
+    # [2026-08-25] "순수 데드레커닝 vs 순수 AMCL" 양자택일 대신 절충안 — AMCL을
+    # 완전히 끄는 게 아니라, "지금 AMCL이 데드레커닝과 크게 어긋나지 않을 때만" 조금씩
+    # 신뢰해서 데드레커닝의 누적 드리프트를 보정한다. 이 구간에서 AMCL이 겪는 문제는
+    # "부정확"이 아니라 "국소함정"(전혀 다른 위치에 확신을 갖고 잘못 수렴, __init__
+    # 주석 참고)이라, 국소함정에 빠진 AMCL 값을 그대로 반영하면 데드레커닝까지 같이
+    # 오염된다 — 그래서 게이트(DR_CORRECT_GATE_M)를 넘는 큰 괴리는 "국소함정 의심"으로
+    # 보고 그냥 버리고, 게이트 안의(=AMCL이 그럴듯하게 동의하는) 작은 괴리만 완만하게
+    # (DR_CORRECT_BLEND_ALPHA만큼만) 앵커를 당긴다 — 급격한 점프로 반영하지 않는
+    # 이유는, 게이트를 통과했더라도 우연히 국소함정이 데드레커닝 근처로 수렴한
+    # 경우까지 완전히 배제할 수는 없어서, 한 번의 나쁜 보정이 주는 피해를 작게
+    # 묶어두기 위함이다(여러 번의 완만한 보정이 누적되면 진짜 드리프트는 결국
+    # 잡히고, 어쩌다 낀 나쁜 값 하나는 다음 보정들이 다시 눌러준다).
+    DR_CORRECT_GATE_M = 0.25       # 이 이내로 AMCL이 데드레커닝과 일치할 때만 신뢰
+    DR_CORRECT_BLEND_ALPHA = 0.15  # 신뢰될 때 앵커를 당기는 비율(완만한 보정)
+    DR_CORRECT_PERIOD_SEC = 0.5    # 보정 주기(매 틱 적용하면 AMCL 노이즈에 과민 반응)
+
+    def _dr_gated_correct(self):
+        """데드레커닝 구간(_drive_corridor_segment의 use_dr=True 루프)에서 매 틱
+        호출됨 — 내부적으로 DR_CORRECT_PERIOD_SEC 간격으로만 실제 보정을 수행한다."""
+        if self._dr_anchor is None or self._cur_pose is None:
+            return
+        now_ns = self._wall_clock.now().nanoseconds
+        if (self._last_dr_correct_t_ns is not None
+                and (now_ns - self._last_dr_correct_t_ns) / 1e9 < self.DR_CORRECT_PERIOD_SEC):
+            return
+        self._last_dr_correct_t_ns = now_ns
+
+        dr = self._dr_pose()
+        if dr is None:
+            return
+        dr_x, dr_y, _ = dr
+        amcl_x, amcl_y, _ = self._cur_pose
+        residual = math.hypot(amcl_x - dr_x, amcl_y - dr_y)
+
+        if residual > self.DR_CORRECT_GATE_M:
+            self.get_logger().info(
+                f'[DR보정] AMCL 무시(국소함정 의심) — 잔차={residual:.2f}m > '
+                f'게이트={self.DR_CORRECT_GATE_M:.2f}m', throttle_duration_sec=1.0)
+            return
+
+        map_x0, map_y0, odom_x0, odom_y0, yaw_offset = self._dr_anchor
+        correction_x = (amcl_x - dr_x) * self.DR_CORRECT_BLEND_ALPHA
+        correction_y = (amcl_y - dr_y) * self.DR_CORRECT_BLEND_ALPHA
+        # odom 쪽 기준점(odom_x0/odom_y0/yaw_offset)은 그대로 두고 map 쪽 앵커만 옮긴다
+        # — odom 상대이동 적산 방식 자체는 안 건드리고, "지금까지 쌓인 오차"만 그
+        # 순간의 최선 추정(map 앵커)에 반영하는 방식이라 이후 odom 델타 계산과
+        # 자연스럽게 이어진다.
+        self._dr_anchor = (map_x0 + correction_x, map_y0 + correction_y, odom_x0, odom_y0, yaw_offset)
+        self.get_logger().info(
+            f'[DR보정] AMCL 신뢰(잔차={residual:.2f}m) — 앵커 보정 '
+            f'({correction_x:+.3f},{correction_y:+.3f})', throttle_duration_sec=1.0)
 
     def _cb_scan(self, msg: LaserScan):
         self._scan_msg = msg
@@ -839,6 +896,11 @@ class ParkingNavigator(Node):
 
         while rclpy.ok():
             self._spin_once_safe(timeout_sec=0.05)
+            if use_dr:
+                # [2026-08-25] 게이트 보정 — AMCL이 데드레커닝과 그럴듯하게 동의할 때만
+                # 조금씩 신뢰해 드리프트를 잡는다(_dr_gated_correct 주석 참고). pose_fn()
+                # 호출 전에 앵커를 먼저 갱신해야 이번 틱부터 보정된 추정치가 반영된다.
+                self._dr_gated_correct()
             dr = pose_fn()
             if dr is None:
                 continue

@@ -1,6 +1,6 @@
 import os
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
@@ -105,16 +105,42 @@ def generate_launch_description():
 
     # ── 센서 드라이버 (라이다/IMU) — UMK track_drive.launch.py와 동일 패키지 include ──
     #   카메라는 주차 미션(라이다+AMCL 기반)에 안 쓰므로 띄우지 않는다.
-    lidar_include = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('xycar_lidar'), 'launch', 'xycar_lidar.launch.py')),
-        condition=IfCondition(bringup_sensors),
-    )
-    imu_include = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(get_package_share_directory('xycar_imu'), 'launch', 'xycar_imu.launch.py')),
-        condition=IfCondition(bringup_sensors),
-    )
+    #
+    # [2026-08-25] IfCondition(bringup_sensors)는 "이 액션을 실행할지"만 런타임에 제어할 뿐,
+    # get_package_share_directory('xycar_lidar'/'xycar_imu')는 launch 트리를 "구성"하는
+    # 시점(이 함수가 실행되는 시점)에 조건과 무관하게 항상 즉시 호출된다 — 그 패키지가
+    # 설치 안 된 환경(예: Gazebo만 있고 xycar 실차 드라이버는 없는 시뮬레이션/개발 환경)에서는
+    # bringup_sensors:=false를 줘도 PackageNotFoundError로 launch 전체가 죽는 걸 실측
+    # 확인함(Docker 기반 시뮬레이션 테스트 중 발견).
+    #
+    # 처음엔 parking_mission_sim.launch.py의 random_start 처리와 동일한 패턴(sys.argv를
+    # 직접 읽어 구성 시점에 분기)으로 고치려 했으나, 실측해보니 그 패턴은 최상위 `ros2
+    # launch` CLI 인자에만 통한다 — bringup_sensors:=false는 parking_mission_sim.launch.py
+    # 내부에서 IncludeLaunchDescription(launch_arguments={...})로 "프로그램적으로" 전달되지
+    # sys.argv엔 안 잡힌다(같은 오류 재현 확인). 그래서 대신 이 패키지가 실제로 설치돼
+    # 있는지(get_package_share_directory 성공 여부)로 판단한다 — bringup_sensors 값과
+    # 무관하게 "패키지가 없으면 건너뛴다"는 게 원하는 동작과 정확히 일치하고, CLI/중첩
+    # include 어느 경로로 호출되든 항상 안전하다.
+    sensor_includes = []
+    try:
+        xycar_lidar_share = get_package_share_directory('xycar_lidar')
+        xycar_imu_share = get_package_share_directory('xycar_imu')
+    except PackageNotFoundError:
+        xycar_lidar_share = None
+        xycar_imu_share = None
+    if xycar_lidar_share is not None and xycar_imu_share is not None:
+        sensor_includes = [
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(xycar_lidar_share, 'launch', 'xycar_lidar.launch.py')),
+                condition=IfCondition(bringup_sensors),
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(xycar_imu_share, 'launch', 'xycar_imu.launch.py')),
+                condition=IfCondition(bringup_sensors),
+            ),
+        ]
 
     # base_link -> laser 정적 TF. AMCL이 /scan(laser_frame_id)을 base_link로 변환하는 데 필요.
     static_tf_lidar = Node(
@@ -200,8 +226,7 @@ def generate_launch_description():
         declare_lidar_x_arg,
         declare_lidar_y_arg,
         declare_lidar_yaw_deg_arg,
-        lidar_include,
-        imu_include,
+        *sensor_includes,
         static_tf_lidar,
         odom_publisher_node,
         cmd_vel_bridge_node,
