@@ -44,8 +44,16 @@ amcl:
     sigma_hit: 0.2
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.2
-    update_min_d: 0.25
+    # [2026-08-22] 병목구간/도킹 재현에서 AMCL 추정 pose가 0.6초 사이 2m 가까이
+    # "점프"하는 현상을 실측(parking_navigator.py _lidar_front_clearance 주석 참고,
+    # Gazebo ground-truth odom과 비교해 확인). 도킹/병목우회 주행속도가 0.13~0.15m/s로
+    # 느린데 기존 update_min_d=0.25m 기준으로는 그 거리를 쌓는 데만 1.7~2초가 걸려—
+    # 그 동안 /amcl_pose가 갱신 없이 그대로 멈춰있다가 임계값을 넘는 순간 한 번에
+    # 크게(그 사이 누적된 오도메트리 오차만큼) "점프"하는 것으로 재현됨. 값을 낮춰
+    # 훨씬 자주(느린 저속 구간에서도) 갱신되도록 함 — 입자 500~2000개+max_beams=60
+    # 조합에서 갱신 빈도를 올려도 이 정도 부하는 감당 가능(실측 CPU 여유 확인).
+    update_min_a: 0.05
+    update_min_d: 0.05
     z_hit: 0.5
     z_max: 0.05
     z_rand: 0.5
@@ -74,7 +82,17 @@ bt_navigator:
     # (BehaviorTreeEngine: "Empty Tree. Exiting with failure.", 실측 확인 2026-08-19).
     # nav2_bringup 공식 기본 params.yaml도 이 두 키를 아예 안 씀 — bt_navigator 자체의
     # 내장 기본값(nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml 등)이
-    # 적용되도록 여기서도 키 자체를 생략한다.
+    # 적용되도록 여기서도 키 자체를 생략(default_nav_through_poses_bt_xml, 이 미션은
+    # 단일 목표만 쓰므로 through_poses 트리는 안 건드림).
+    # [2026-08-22] default_nav_to_pose_bt_xml만 명시적으로 지정 — 대회 실차는 후진이
+    # 금지되어 있는데(사용자 확인), Nav2 기본 트리는 FollowPath 실패 시 복구 폴백으로
+    # Spin/Wait와 함께 BackUp(후진 0.3m)도 자동 시도한다. parking_navigator.py의 도킹
+    # 로직에서 후진을 없앤 것과 별개로, 여기서 후진이 실제로 발생하는 걸 실측 확인함
+    # (도킹 진입 전, Nav2 자체 복구 단계의 "Running backup" 로그와 함께 벽 충돌). 기본
+    # 트리를 그대로 복사하고 <BackUp/> 한 줄만 뺀 config/behavior_trees/
+    # navigate_to_pose_no_reverse.xml을 대신 쓴다.
+    # ⚠ 절대경로 하드코딩 — 이 워크스페이스를 다른 경로/사용자로 재빌드하면 갱신 필요.
+    default_nav_to_pose_bt_xml: "/home/xytron/parking_mission/parking_mission/ROS2_ws/install/parking_mission/share/parking_mission/config/behavior_trees/navigate_to_pose_no_reverse.xml"
     # 원래 이 목록엔 nav2_navigate_to_pose_action_bt_node용 트리에 필요한 것들만 일부
     # 담겨 있었는데, bt_navigator는 activate 시 navigate_to_pose "그리고"
     # navigate_through_poses 기본 트리를 둘 다 로드하려고 시도한다 — through_poses
@@ -170,7 +188,7 @@ controller_server:
       # 실측 최대 지상속도는 1.449 m/s(cmd=20, 실제속도측정.md)지만, 주차는 5cm/3도 정밀도가
       # 필요한 정지 기동이라 안전 여유를 크게 두고 0.3 m/s로 제한(추후 실차에서 오버슈트/
       # 진동 없으면 올려도 됨).
-      desired_linear_vel: 0.3
+      desired_linear_vel: 0.6
       lookahead_dist: 0.4
       min_lookahead_dist: 0.3
       max_lookahead_dist: 0.6
@@ -338,31 +356,22 @@ global_costmap:
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # local_costmap과 동일한 이유(위 §local_costmap.inflation_layer 주석의 팀원
-        # 커밋 관련 설명 참고)로 robot_radius(0.36)+0.45=0.81m는 목표(벽에서 0.5m)를
-        # 통행불가로 만들어 안 쓴다.
-        # inflation_radius를 0.1로 줄인 만큼(주차영역 A 목표 도달을 위해) 장애물을 밀어내는
-        # 힘도 약해져서, 실측 결과 좁은 통로(내부 기둥 사이 ~1m)에서 경로가 한쪽 장애물에
-        # 거의 닿을 정도로 붙어버리는 것을 확인함(2026-08-19, base_link가 기둥에서
-        # 0.25m까지 근접, robot_radius 0.36m보다 가까움 — "Failed to make progress"로
-        # 컨트롤러가 정지). inflation_radius(도달 가능성과 직결)는 더 못 줄이니, 대신
-        # cost_scaling_factor를 3.0->8.0으로 높여 좁은 반경 안에서도 장애물 근처 비용이
-        # 훨씬 가파르게 커지도록 해서 경로가 통로 중앙 쪽으로 더 붙게 유도한다.
-        # [2026-08-20] 8.0에서도 마진을 올려가며 재현되는 벽 접촉이 계속돼서 12.0으로
-        # 추가 상향(마진/풋프린트는 그대로 — 경로 "선호"만 더 강하게 중앙으로 유도).
-        # FollowPath.inflation_cost_scaling_factor와 반드시 같은 값이어야 함(위 참고).
-        # [2026-08-20] 12.0으로 올린 직후 스폰 위치 근처에서 "Starting point in lethal
-        # space"가 새로 발생 — 이전(8.0)엔 없던 증상이라 회귀 의심돼 8.0으로 되돌리고
-        # use_cost_regulated_linear_velocity_scaling 단독 효과부터 분리 확인한다.
+        # [2026-08-22] 위 inflation_radius=0.1 제약(과 그 근거였던 robot_radius=0.36
+        # 계산)은 전부 local_costmap의 "원형 근사(robot_radius)" 기준이다 — 이 global
+        # costmap은 아래 footprint(사각형, [[0.39,0.225]...])를 쓰므로 실제 inscribed
+        # radius는 min(0.39,0.225)=0.225m로 local_costmap의 robot_radius(0.36m)보다
+        # 훨씬 작다. "목표(벽에서 0.5m)가 통행불가가 된다"는 제약은 inscribed radius
+        # 기준(0.225+inflation_radius<0.5 => inflation_radius<0.275)이지 robot_radius
+        # 기준이 아니므로, 이 global costmap만은 0.25까지 늘려도 목표 도달가능성이
+        # 깨지지 않는다(local_costmap의 0.1은 그대로 둠 — 거긴 진짜 robot_radius=0.36
+        # 기준이라 위 제약이 유효함). 실측 확인: 폭 0.1로는 중앙 기둥과 왼쪽 벽 사이
+        # 폭 0.7m대 통로에서 경로가 기둥 쪽에 거의 붙어(클리어런스 0.10~0.11m)
+        # "Starting point in lethal space"로 막힘 — parking_map.pgm 거리변환으로 그
+        # 통로 자체는 중앙(클리어런스 0.40m 지점)으로 가면 충분히 넓다는 걸 확인했으므로,
+        # 물리적 병목이 아니라 "중앙으로 붙일 유인 부족"이 원인이라고 판단했다.
         cost_scaling_factor: 8.0
-        # 원래 0.3 — 주차영역 A 목표(0,4.2)가 벽에서 정확히 0.5m 떨어져 있는데,
-        # robot_radius(0.36) + inflation_radius(0.3) = 0.66m가 그보다 커서 목표 지점
-        # 자체가 코스트맵 inflation 영역(사실상 통행불가로 취급됨)에 걸려 플래너가
-        # "failed to create plan with tolerance 0.50"로 계속 실패하는 것을 실측 확인함
-        # (2026-08-19). robot_radius(0.36) + 0.1 = 0.46m < 0.5m로 여유를 두기 위해
-        # 0.1로 낮춤 — 목표 좌표 자체는 그대로 두고(실측/대회 기준일 수 있어 안 건드림)
-        # 안전여유만 줄인 것이므로, 장애물 회피 민감도가 전반적으로 낮아짐에 유의.
-        inflation_radius: 0.1
+        # 0.1 -> 0.25(위 주석 근거: 이 costmap은 footprint 기반이라 0.275까지 여유 있음).
+        inflation_radius: 0.25
       always_send_full_costmap: true
 
 map_server:
@@ -429,6 +438,23 @@ planner_server:
       # WHEELBASE_M / tan(ANGLE_MAX_DEG) = 0.335 / tan(80°) ≈ 0.06m — 위 FollowPath의
       # min_turning_radius와 동일 값(같은 차량 물리 제약이므로 두 플러그인이 일치해야 함).
       minimum_turning_radius: 0.06
+      # [2026-08-22] SmacPlannerHybrid로 바꿔도(위 2026-08-20 기록과 동일 증상 재발)
+      # 여전히 넓은 서쪽 통로를 두고 동쪽 벽에 바짝 붙어(실측 클리어런스 0.10~0.11m,
+      # parking_map.pgm 거리변환으로 확인) 지나가는 걸 재확인함 — inflation_radius가
+      # 0.1m로 얇아서(목표 도달가능성 때문에 못 늘림, 위 관련 주석 참고) 그 얇은 대역을
+      # 벗어난 두 경로(벽에 붙은 경로 vs 열린 경로)의 비용 차이가 순수 거리 차이에 묻힐
+      # 만큼 작다고 보인다. cost_penalty(기본값 2.0, 코스트맵 비용을 거리 대비 얼마나
+      # 중요하게 볼지)를 올려서, inflation_radius/목표 도달가능성은 그대로 두고 "벽에
+      # 붙는 경로"에 대한 기피만 강화한다.
+      # [2026-08-22] global_costmap.inflation_radius를 0.1->0.25로 넓힌 뒤(위 global_costmap
+      # 주석 참고) 경로가 실제로 중앙(클리어런스 0.35~0.42m)으로 붙는 걸 실측 확인 —
+      # 이전(중앙기둥에 0.10m로 붙던 것)보다는 크게 개선됐지만, 그 병목 통과 시점에
+      # 로봇 헤딩이 통로 축과 비스듬해지며(경로가 그 지점에서 커브 중) 풋프린트의
+      # 유효 폭이 늘어나 여전히 간헐적으로 lethal 판정이 나는 걸 확인함(스크린샷으로
+      # 확인: 차량이 그 좁은 지점에 대각선으로 낌). cost_penalty를 4.0->6.0으로 추가
+      # 상향해 그 병목 주변 비용 기피를 더 강하게 만들어, 플래너가 그 지점을 헤딩이
+      # 더 안정된(통로 축에 가까운) 상태로 지나가는 경로를 찾도록 유도한다.
+      cost_penalty: 4.0
 
 behavior_server:
   ros__parameters:
@@ -436,6 +462,15 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
+    # [2026-08-22] "backup"(BackUp)을 플러그인 목록에서 뺐다가 bt_navigator 전체가
+    # activate 실패하는 걸 실측 확인함 — 위 bt_navigator 주석대로 activate 시
+    # navigate_through_poses 기본 트리도 같이 로드를 시도하는데, 그 트리는(우리가 안
+    # 쓰는데도) 여전히 BackUp을 참조해서 "backup" 액션서버가 없으면 "Action server
+    # backup not available"로 bt_navigator 자체가 안 뜬다. 그래서 backup 플러그인은
+    # 그대로 등록해 액션서버는 존재하게 두고, 실제 후진 호출은 위
+    # default_nav_to_pose_bt_xml의 커스텀 트리에서 <BackUp/>을 빼는 걸로만 막는다 —
+    # 이 미션은 navigate_to_pose만 쓰므로 through_poses 트리가 이론상 backup을 갖고
+    # 있어도 실제로 호출될 일이 없다.
     behavior_plugins: ["spin", "backup", "wait"]
     # nav2_navfn_planner와 동일한 이유(pluginlib 조회명은 "package/ClassAlias" 형식) —
     # nav2_behaviors의 behavior_plugin.xml도 슬래시로 export돼 있음. "::" 형식은

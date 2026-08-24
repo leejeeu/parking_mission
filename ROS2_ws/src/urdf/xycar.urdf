@@ -312,8 +312,20 @@
       <left_steering_i_range>0 0</left_steering_i_range>
       <right_steering_pid_gain>0.5 0 0.05</right_steering_pid_gain>
       <right_steering_i_range>0 0</right_steering_i_range>
-      <linear_velocity_pid_gain>0.3 0 0.02</linear_velocity_pid_gain>
-      <linear_velocity_i_range>0 0</linear_velocity_i_range>
+      <!-- [2026-08-22] 위 스케일링값(P=0.3)이 목표속도를 거의 못 따라간다는 걸 실측
+           확인함 — /gazebo/cmd_vel에 linear.x=0.15m/s를 계속 명령했는데 실제
+           /gazebo/odom 이동속도는 평균 0.0064m/s(명령의 4.3%)에 불과했다(2026-08-22,
+           40초간 위치추적으로 확인). I항이 0(i_range 0 0으로 사실상 비활성화)인
+           P-only 제어는 마찰 등 상시 부하 아래서 구조적으로 정상상태 오차가 남는데,
+           그 오차가 이 정도로 크다는 건 P 게인 자체가 너무 작다는 뜻 — 관성비 스케일링이
+           과했던 것으로 보인다. 관절 effort 상한(1.0, 위 주석 참고)이 이미 토크
+           폭주를 막는 안전장치로 존재하므로, 게인을 크게 올려도(포화되면 그 상한에서
+           안전하게 clamp됨) 발산 위험 없이 추종성을 높일 수 있다고 판단해 P를
+           0.3->5.0으로, I를 0(사실상 비활성)->0.5로(정상상태 오차 제거, i_range로
+           windup 제한) 상향한다. 실차 재현이 목적이므로 여전히 근사치이며, 이후 실측
+           재확인 필요.-->
+      <linear_velocity_pid_gain>5.0 0.5 0.02</linear_velocity_pid_gain>
+      <linear_velocity_i_range>-0.5 0.5</linear_velocity_i_range>
 
       <publish_odom>true</publish_odom>
       <publish_odom_tf>false</publish_odom_tf>
