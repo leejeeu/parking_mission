@@ -82,17 +82,12 @@ bt_navigator:
     # (BehaviorTreeEngine: "Empty Tree. Exiting with failure.", 실측 확인 2026-08-19).
     # nav2_bringup 공식 기본 params.yaml도 이 두 키를 아예 안 씀 — bt_navigator 자체의
     # 내장 기본값(nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml 등)이
-    # 적용되도록 여기서도 키 자체를 생략(default_nav_through_poses_bt_xml, 이 미션은
-    # 단일 목표만 쓰므로 through_poses 트리는 안 건드림).
-    # [2026-08-22] default_nav_to_pose_bt_xml만 명시적으로 지정 — 대회 실차는 후진이
-    # 금지되어 있는데(사용자 확인), Nav2 기본 트리는 FollowPath 실패 시 복구 폴백으로
-    # Spin/Wait와 함께 BackUp(후진 0.3m)도 자동 시도한다. parking_navigator.py의 도킹
-    # 로직에서 후진을 없앤 것과 별개로, 여기서 후진이 실제로 발생하는 걸 실측 확인함
-    # (도킹 진입 전, Nav2 자체 복구 단계의 "Running backup" 로그와 함께 벽 충돌). 기본
-    # 트리를 그대로 복사하고 <BackUp/> 한 줄만 뺀 config/behavior_trees/
-    # navigate_to_pose_no_reverse.xml을 대신 쓴다.
-    # ⚠ 절대경로 하드코딩 — 이 워크스페이스를 다른 경로/사용자로 재빌드하면 갱신 필요.
-    default_nav_to_pose_bt_xml: "/home/xytron/parking_mission/parking_mission/ROS2_ws/install/parking_mission/share/parking_mission/config/behavior_trees/navigate_to_pose_no_reverse.xml"
+    # 적용되도록 여기서도 키 자체를 생략한다.
+    # [2026-08-22 도입 → 2026-08-24 원복] 한때 "대회 실차는 후진 금지"라는 (잘못된) 전제로
+    # <BackUp/>을 뺀 커스텀 트리(config/behavior_trees/navigate_to_pose_no_reverse.xml)를
+    # 여기 지정했었다. 후진이 실제로는 완전히 허용된다는 게 확인되어(2026-08-24) 그
+    # 커스텀 트리와 이 오버라이드를 제거하고 nav2 기본 트리(BackUp 포함)로 되돌린다 —
+    # 절대경로 하드코딩 문제도 이걸로 같이 해소됨.
     # 원래 이 목록엔 nav2_navigate_to_pose_action_bt_node용 트리에 필요한 것들만 일부
     # 담겨 있었는데, bt_navigator는 activate 시 navigate_to_pose "그리고"
     # navigate_through_poses 기본 트리를 둘 다 로드하려고 시도한다 — through_poses
@@ -186,8 +181,9 @@ controller_server:
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
       # 실측 최대 지상속도는 1.449 m/s(cmd=20, 실제속도측정.md)지만, 주차는 5cm/3도 정밀도가
-      # 필요한 정지 기동이라 안전 여유를 크게 두고 0.3 m/s로 제한(추후 실차에서 오버슈트/
-      # 진동 없으면 올려도 됨).
+      # 필요한 정지 기동이라 안전 여유를 크게 두고 0.6 m/s로 제한(desired_linear_vel은
+      # "목표"일 뿐 아래 velocity_smoother.max_velocity(0.4)가 최종 상한 — 실제 주행은
+      # 항상 0.4 m/s 이하로 나감. 추후 실차에서 오버슈트/진동 없으면 올려도 됨).
       desired_linear_vel: 0.6
       lookahead_dist: 0.4
       min_lookahead_dist: 0.3
@@ -230,7 +226,11 @@ controller_server:
       # (vehicle_spec.py 실측값 기반 역산치, 실측 아님).
       min_turning_radius: 0.06
       use_interpolation: true
-      allow_reversing: false
+      # [2026-08-22 도입 → 2026-08-24 원복] "대회 실차는 후진 금지"라는 전제로 false를
+      # 썼었는데, 그 전제가 잘못된 것으로 확인됨(2026-08-24, 사용자 확인) — 후진은 완전히
+      # 허용된다. true로 되돌려 아래 planner_server.GridBased의 REEDS_SHEPP(후진 허용
+      # 경로탐색)와 다시 정합을 맞춘다.
+      allow_reversing: true
 
 local_costmap:
   local_costmap:
@@ -404,17 +404,14 @@ planner_server:
     # 제약을 넣어 "차가 실제로 따라갈 수 있는" 곡선 경로만 생성한다(=사용자가 말한 Modified A*).
     GridBased:
       # [2026-08-22] 팀원 커밋(190b764)과 병합충돌 — 팀원도 독립적으로 같은 결론
-      # (NavfnPlanner->SmacPlannerHybrid)에 도달했지만 세 가지가 이 세션의 실측
+      # (NavfnPlanner->SmacPlannerHybrid)에 도달했지만 두 가지가 이 세션의 실측
       # 검증과 안 맞아서 팀원 쪽을 버리고 내 쪽(아래)을 남긴다:
       #  1) plugin 이름이 "nav2_smac_planner::SmacPlannerHybrid"(콜론 두 개) 형식인데,
       #     이 환경에서 pluginlib이 "package/ClassAlias" 슬래시 형식만 인식하고 콜론
       #     형식은 "class ... does not exist" FATAL로 planner_server가 죽는 걸 오늘
       #     실측 확인함(behavior_server의 동일 문제와 같은 원인, 아래 behavior_server
       #     주석도 참고).
-      #  2) motion_model_for_search: REEDS_SHEPP(후진 허용)을 썼는데, FollowPath
-      #     (RegulatedPurePursuitController)는 allow_reversing: false라 후진 구간이
-      #     있는 경로를 애초에 못 따라간다 — 플래너와 컨트롤러가 서로 안 맞는 상태.
-      #  3) minimum_turning_radius: 0.6을 "최대조향각 30도(설계값)" 가정으로 역산했는데,
+      #  2) minimum_turning_radius: 0.6을 "최대조향각 30도(설계값)" 가정으로 역산했는데,
       #     이 저장소의 vehicle_spec.py는 ANGLE_MAX_DEG=80.0(서보 클램프값)을 명시하고
       #     있고 FollowPath.min_turning_radius도 그 값 기준(0.06)으로 이미 맞춰져 있다
       #     — 두 플러그인이 같은 차량 물리 제약을 써야 하는데 0.6 vs 0.06으로 10배 차이.
@@ -431,10 +428,18 @@ planner_server:
       plugin: "nav2_smac_planner/SmacPlannerHybrid"
       tolerance: 0.5
       allow_unknown: false   # 주차장은 맵 밖 미탐사 영역으로 계획하지 않도록 false 권장
-      # FollowPath(RegulatedPurePursuitController)가 allow_reversing: false라 후진
-      # 구간이 있는 경로를 못 따라간다 — 그래서 REEDS_SHEPP(후진 허용) 대신
-      # DUBIN(전진만)으로 컨트롤러 제약과 일치시킨다.
-      motion_model_for_search: "DUBIN"
+      # [2026-08-22 도입 → 2026-08-24 원복] "대회 실차는 후진 금지"라는 (잘못된) 전제로
+      # DUBIN(전진만)을 썼었다 — 후진이 완전히 허용된다는 게 확인되어(2026-08-24) 원래
+      # 의도(팀원 커밋 190b764도 독립적으로 같은 결론)였던 REEDS_SHEPP(후진 허용)으로
+      # 되돌린다. 위 FollowPath.allow_reversing도 true로 맞춰 두 플러그인이 다시
+      # 정합하도록 함. 2구역(A/B) 순회 + 출발지 복귀 미션에서 후진 진입이 필요한
+      # T자/평행주차 형태를 지원하려면 이게 반드시 필요.
+      motion_model_for_search: "REEDS_SHEPP"
+      # REEDS_SHEPP 도입에 맞춰 추가 — 후진 자체를 막지는 않되(경로가 필요하면 씀),
+      # 순수 전진보다 비용을 더 매겨서 불필요한 후진 남용(예: 왔다갔다 하며 최적화)을
+      # 억제한다. 참고: 팀원 커밋(190b764)이 REEDS_SHEPP와 함께 쓰려 했던 값(2.0)을
+      # 시작점으로 채택 — 시뮬레이션 실측 후 필요하면 조정.
+      reverse_penalty: 2.0
       # WHEELBASE_M / tan(ANGLE_MAX_DEG) = 0.335 / tan(80°) ≈ 0.06m — 위 FollowPath의
       # min_turning_radius와 동일 값(같은 차량 물리 제약이므로 두 플러그인이 일치해야 함).
       minimum_turning_radius: 0.06
@@ -462,15 +467,11 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
-    # [2026-08-22] "backup"(BackUp)을 플러그인 목록에서 뺐다가 bt_navigator 전체가
-    # activate 실패하는 걸 실측 확인함 — 위 bt_navigator 주석대로 activate 시
-    # navigate_through_poses 기본 트리도 같이 로드를 시도하는데, 그 트리는(우리가 안
-    # 쓰는데도) 여전히 BackUp을 참조해서 "backup" 액션서버가 없으면 "Action server
-    # backup not available"로 bt_navigator 자체가 안 뜬다. 그래서 backup 플러그인은
-    # 그대로 등록해 액션서버는 존재하게 두고, 실제 후진 호출은 위
-    # default_nav_to_pose_bt_xml의 커스텀 트리에서 <BackUp/>을 빼는 걸로만 막는다 —
-    # 이 미션은 navigate_to_pose만 쓰므로 through_poses 트리가 이론상 backup을 갖고
-    # 있어도 실제로 호출될 일이 없다.
+    # "backup"(BackUp)을 플러그인 목록에서 빼면 bt_navigator 전체가 activate 실패한다
+    # (activate 시 navigate_through_poses 기본 트리도 같이 로드를 시도하는데, 그 트리가
+    # BackUp을 참조하므로 "backup" 액션서버가 없으면 "Action server backup not
+    # available"로 bt_navigator 자체가 안 뜸, 실측 확인 2026-08-22). 후진이 허용되는
+    # 지금은 이 액션서버가 기본 트리의 복구 폴백에서 실제로도 정상적으로 호출된다.
     behavior_plugins: ["spin", "backup", "wait"]
     # nav2_navfn_planner와 동일한 이유(pluginlib 조회명은 "package/ClassAlias" 형식) —
     # nav2_behaviors의 behavior_plugin.xml도 슬래시로 export돼 있음. "::" 형식은

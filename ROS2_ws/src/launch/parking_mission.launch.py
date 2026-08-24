@@ -47,9 +47,14 @@ def generate_launch_description():
         'autostart', default_value='true',
         description='Nav2 lifecycle 노드 자동 활성화 여부')
 
+    # [2026-08-24] 공식 경기 규정 확인 결과 이 미션은 "출발 → A 주차 → B 주차 →
+    # 출발지 복귀"를 한 번에 전부 수행해야 한다 — 기본값을 'FULL'로 바꿔 그 전체
+    # 시퀀스가 기본 동작이 되도록 함. 'A'/'B'처럼 개별 레그 이름을 주면 그 레그
+    # 하나만 실행한다(디버깅/개별 구간 튜닝용, 기존 단일 레그 동작과 동일).
     declare_parking_zone_arg = DeclareLaunchArgument(
-        'parking_zone', default_value='A',
-        description="목표 주차영역 선택: 'A' 또는 'B'")
+        'parking_zone', default_value='FULL',
+        description="'FULL'(기본값)이면 출발→A→B→출발복귀 전체 순회, "
+                     "'A'/'B'/'START'를 주면 그 레그 하나만 실행(디버깅용)")
 
     declare_set_initial_pose_arg = DeclareLaunchArgument(
         'set_initial_pose', default_value='true',
@@ -168,6 +173,13 @@ def generate_launch_description():
                     'start_x': start_x,
                     'start_y': start_y,
                     'start_yaw': start_yaw,
+                    # [2026-08-24] 이전엔 static_tf_lidar(TF)에만 전달되고 parking_navigator
+                    # 노드 자신에게는 안 넘어갔다 — 그 결과 _lidar_front_clearance()/
+                    # _lidar_steer_bias()가 raw /scan 각도를 TF 없이 직접 쓰면서도 이
+                    # 오프셋을 몰라 "정면"을 잘못 판단하는 버그가 있었다(위
+                    # declare_lidar_yaw_deg_arg 주석과 동일 근거). 이제 노드 파라미터로도
+                    # 전달해 그 두 함수가 보정할 수 있게 한다.
+                    'lidar_yaw_deg': lidar_yaw_deg,
                 }],
             )
         ],

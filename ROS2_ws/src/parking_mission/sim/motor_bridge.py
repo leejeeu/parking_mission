@@ -17,8 +17,10 @@
 #   remapping 처리).
 #
 # 변환식: cmd_vel_bridge.py의 변환(Twist -> xycar_motor)을 그대로 역산한다.
-#   steer_rad = atan2(angular_z*L, v) 로 인코딩됐으므로, v!=0인 한
-#   angular_z = v * tan(steer_rad) / L 로 복원 가능(atan2/tan은 이 범위에서 서로 역함수).
+#   steer_rad = atan2(sign(v)*angular_z*L, abs(v)) 로 인코딩됐으므로(2026-08-24,
+#   후진 시 atan2 부호 버그 수정 반영), v!=0인 한 angular_z = v * tan(steer_rad) / L 로
+#   복원 가능 — 이 역변환 자체는 v의 부호와 무관하게 항상 성립하므로(tan은 부호를
+#   그대로 통과시킴) 수정 전/후 공식 모두에 대해 변경 없이 올바르다.
 #   부호규약도 cmd_vel_bridge.py와 동일하게 반전(UMK: 음수 조향각=좌회전).
 #
 # 안전장치: xycar_motor가 CMD_TIMEOUT_SEC 이상 안 오면(예: 상위 노드가 죽음) 워치독이

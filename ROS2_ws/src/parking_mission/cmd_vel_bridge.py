@@ -9,8 +9,17 @@
 #   controller_server(DWB 등)는 Twist(linear.x m/s, angular.z rad/s)만 내보내므로 그 사이를
 #   이 노드가 변환한다.
 #
-# 변환식 (자전거 모델): angular_z = v * tan(steer) / L  =>  steer = atan2(angular_z * L, v).
-#   v=0 근처에서도 atan2는 안전하게 ±90도 근방을 반환(어차피 ANGLE_MAX로 clip됨).
+# 변환식 (자전거 모델): angular_z = v * tan(steer) / L  =>  steer = atan(angular_z * L / v).
+#   [2026-08-24 수정] atan2(angular_z*L, v)를 그대로 쓰면 v<0(후진)일 때 틀린 각을
+#   반환한다 — atan2는 (v, angular_z*L)을 벡터로 보고 사분면까지 판정하는데, v가
+#   음수가 되는 순간 결과가 0 근방이 아니라 ±180도 근방으로 튄다(예: 직진 후진,
+#   angular_z=0, v=-0.3 → atan2(0,-0.3)=180도, steer가 완전히 잘못됨). steer는
+#   진행방향과 무관하게 항상 물리적으로 (-90,90)도 안에 있어야 하므로, v의 부호를
+#   분리해서 atan2의 "x" 인자를 항상 abs(v)로 넣어야 한다(steer = atan2(sign(v)*
+#   angular_z*L, abs(v))). 이 수정 전까지는 후진이 정책상 금지돼 있어(2026-08-22
+#   ~24) 실제로 트리거되지 않았지만, 후진이 허용되는 지금은 매 후진 명령마다
+#   재현되는 문제라 정식으로 고친다. v=0 근처에서도 atan2는 안전하게 ±90도 근방을
+#   반환(어차피 ANGLE_MAX로 clip됨).
 #
 # 부호규약: ROS 표준(REP103)은 angular.z > 0이 반시계(좌회전)인데, UMK 프로젝트는 반대로
 #   음수가 좌회전(config.py TURN_ANGLE=-60 주석 "좌회전"). 그래서 부호를 뒤집는다.
@@ -52,7 +61,8 @@ class CmdVelBridge(Node):
         self._publish_motor(msg.linear.x, msg.angular.z)
 
     def _publish_motor(self, linear_x, angular_z):
-        steer_rad = math.atan2(angular_z * WHEELBASE_M, linear_x)
+        sign_v = 1.0 if linear_x >= 0.0 else -1.0
+        steer_rad = math.atan2(sign_v * angular_z * WHEELBASE_M, abs(linear_x))
         angle_deg = -math.degrees(steer_rad)   # UMK 부호규약(음수=좌회전)에 맞춰 반전
         angle_deg = max(-ANGLE_MAX_DEG, min(ANGLE_MAX_DEG, angle_deg))
 
