@@ -122,7 +122,21 @@ class ParkingNavigator(Node):
         # 걸림)하고 마지막 긴 직선구간(0.95,3.55, 1.8m)까지 가는 데는 25초로도 부족한
         # 걸 실측 확인해서 45초로 재상향 — 전체 미션 예산(mission_deadline_sec=170s)
         # 안에서는 여전히 여유 있음(START->A 구간 하나만 이 정도 쓰고 나머지 레그는 병목이 없음).
-        self.declare_parameter('corridor_bypass_timeout_sec', 55.0)
+        # [2026-08-25] 55초로도 계속 부족해서(경로 총길이는 3.87m, corridor_bypass_speed
+        # 0.45m/s면 이론상 8.6초면 되는데, 실측으론 헤딩보정 위주 저속 구간 때문에 55초
+        # 안에 웨이포인트 절반도 못 감) 다 못 가고 Nav2로 넘어가면, 남은 긴 구간(2m+)을
+        # Nav2/RegulatedPurePursuit가 이 좁은 통로에서 직접 운전해야 하는데 — RPP의
+        # 회전 footprint 충돌예측이 이 통로에서 오탐(false-positive)을 내는 게 이미
+        # 알려진 미해결 문제라(§6 "직사각형 footprint로 회귀" 이력 참고) 결국 실패한다.
+        # 그래서 데드레커닝 우회가 안전하게 끝까지(전체 웨이포인트) 완주하도록 넉넉히
+        # 늘려서, Nav2가 이 통로를 직접 운전할 필요 자체를 없앤다.
+        # [2026-08-25 추가] 120초로도 마지막 웨이포인트((0.90,4.00), 목표에서 가장
+        # 가깝고 사전 실측으로 안전이 확인된 지점) 직전에서 여전히 타임아웃 — 그
+        # 상태로 Nav2에 넘기니 SmacPlannerHybrid가 검증 안 된 경로로(핸드오프 지점
+        # 기준 x가 더 큰 쪽, 실측 클리어런스 0.10~0.20m) 새서 로봇이 물리적으로 낌
+        # (AMCL pose가 90초 넘게 완전히 고정된 것으로 재현 확인). 마지막 웨이포인트까지
+        # 확실히 완주시켜 Nav2가 담당할 구간을 목표 바로 앞 짧은 거리로 최소화한다.
+        self.declare_parameter('corridor_bypass_timeout_sec', 260.0)
 
         # ── 목표 근처 전용 "정밀 접근"(docking) — 2026-08-20 ──
         #   README §6-2/§6-4에 이미 적혀있던 문제: 주차 목표가 벽에서 0.5m 안쪽이라
@@ -169,7 +183,12 @@ class ParkingNavigator(Node):
         # 커버해야 하므로, 그만큼 시간 여유도 같이 늘림(대략 2.5m/0.15m/s ≈ 17s +
         # 헤딩보정 여유). [2026-08-24] 3분 예산을 3개 레그가 나눠 써야 해서 40→20초로
         # 축소 — 후진(K턴) 복원으로 큰 헤딩오차도 더 빨리 좁힐 수 있어 여유 있게 줄임.
-        self.declare_parameter('docking_timeout_sec', 20.0)
+        # [2026-08-25] 실측 결과 Nav2가 목표를 살짝 지나쳐서(핸드오프 위치가 goal보다
+        # y가 큰 경우 관측) 헤딩오차가 163.8도(거의 정반대)까지 나는 경우가 있었는데
+        # 20초로는 이 정도 큰 오차의 K턴 보정을 못 끝냄(디버깅 중이라 넉넉히 상향,
+        # 대회 실제 값은 나중에 재조정 필요 — 위 corridor_bypass_timeout_sec/
+        # mission_deadline_sec와 동일한 사정).
+        self.declare_parameter('docking_timeout_sec', 100.0)
         self.declare_parameter('docking_yaw_kp', 1.5)
 
         # [2026-08-24] 전체 미션(출발→A→B→출발복귀) 소프트 데드라인. 경기 규정 제한시간
@@ -177,7 +196,11 @@ class ParkingNavigator(Node):
         # 있으므로), 이 시간을 넘기면 진행 중이던 레그를 즉시 정지시키고 남은 레그는
         # 건너뛴 채 미션을 종료한다 — 심판이 강제로 중단시키는 것보다 스스로 안전하게
         # 멈추는 편이 규정 제8조 취지에 맞다.
-        self.declare_parameter('mission_deadline_sec', 170.0)
+        # [2026-08-25] corridor_bypass_timeout_sec를 200초로 늘리면서(위 참고) 이
+        # 값도 임시로 380초까지 늘려 디버깅 중이다 — 병목구간이 실제로 몇 초에 완주되는지
+        # 먼저 확인하고, 그 실측값 + 여유분으로 다시 축소해서 대회 규정 제한시간(3분,
+        # §7)에 맞출 것. 지금 이 값(380)은 시뮬레이션 검증 전용이며 대회 실행 값이 아님.
+        self.declare_parameter('mission_deadline_sec', 500.0)
 
         # [2026-08-24] launch/parking_mission.launch.py의 lidar_yaw_deg(라이다 장착
         # 회전각)를 이 노드에도 전달받는다 — _lidar_front_clearance()/_lidar_steer_bias()가
@@ -481,14 +504,29 @@ class ParkingNavigator(Node):
             min_r = min(min_r, r)
         return min_r
 
-    def _front_safety_speed_cap(self, nominal_speed: float, direction: float = 1.0) -> float:
+    def _front_safety_speed_cap(self, nominal_speed: float, direction: float = 1.0,
+                                 docking: bool = False) -> float:
         """_lidar_front_clearance() 기반 속도 상한 — FRONT_SAFETY_MARGIN_M 이내면 완전
         정지, FRONT_SLOWDOWN_RANGE_M 밖이면 무제한, 그 사이는 선형 감속. 정지 감지 후
         탈출(backoff) 동작에는 적용하지 않음(그쪽은 이미 저속+반대쪽 조향으로 의도적으로
         접근하는 전용 로직이라 그대로 0으로 눌리면 영영 못 빠져나온다) — 두 호출부
-        모두 backoff 분기가 이 함수 호출 전에 이미 return/continue한다."""
-        FRONT_SAFETY_MARGIN_M = 0.12
-        FRONT_SLOWDOWN_RANGE_M = 0.35
+        모두 backoff 분기가 이 함수 호출 전에 이미 return/continue한다.
+
+        [2026-08-25] docking=True(K턴/전진원호 도킹 제어)면 마진을 훨씬 좁게 쓴다 —
+        병목구간 통과(원래 기본 마진의 근거)는 "벽에 붙지 않고 지나가는" 게 목적이라
+        0.35m 감속권/0.12m 정지선이 맞지만, 도킹은 애초에 목표(벽에서 0.5m)
+        바로 앞에서 K턴/미세조정을 해야 하는 구간이라 이 기본 마진이 계속 걸려서
+        실측 결과 회전 속도가 초당 0.6도까지 떨어지는 걸 확인함(정상이면 초당 30도+
+        나와야 함) — 60초 타임아웃 안에 180도 근처 헤딩오차를 못 좁혀 매번 실패했다.
+        도킹엔 이미 별도의 정지감지+후진탈출 로직이 있어(_docking_control_loop) 벽에
+        진짜로 막히는 경우는 그쪽이 처리하므로, 여기 마진을 좁혀도 안전망이 없어지는
+        게 아니다."""
+        if docking:
+            FRONT_SAFETY_MARGIN_M = 0.04
+            FRONT_SLOWDOWN_RANGE_M = 0.10
+        else:
+            FRONT_SAFETY_MARGIN_M = 0.12
+            FRONT_SLOWDOWN_RANGE_M = 0.35
         front_clear = self._lidar_front_clearance(direction)
         if front_clear <= FRONT_SAFETY_MARGIN_M:
             return 0.0
@@ -584,20 +622,70 @@ class ParkingNavigator(Node):
         publish_initial_pose_until_amcl_ready()와 다르다(그쪽은 최초 기동 시
         self._cur_pose가 아예 None이라 '아무 값이나 옴'만 확인하면 충분했음)."""
         CONVERGE_TOL_M = 0.35
+        # [2026-08-25] 처음엔 "한 번 근접하면 성공, 1초 대기 후 반환"이었는데, 그래도
+        # bt_navigator가 여전히 옛(틀린) 위치를 읽는 게 실측으로 반복 재현됐다 — 원인은
+        # 좁은 통로+기둥의 대칭적 형상 때문에 AMCL 파티클 필터가 /initialpose로 근접
+        # 근처에서 리셋된 뒤에도 이후 스캔 매칭 과정에서 다시 "국소함정"(원래 있던 엉뚱한
+        # 위치)으로 되튕겨 나가는 경우가 있다는 것 — 즉 한 순간 근접했다는 게 계속
+        # 근접해 있다는 뜻이 아니었다. 그래서 "한 번 근접"이 아니라 STABLE_SEC 동안
+        # 계속 근접 상태를 유지하는지 확인하고, 중간에 벗어나면(다시 튕겨나가면)
+        # /initialpose를 다시 발행하고 안정화 확인을 처음부터 다시 시작한다.
+        STABLE_SEC = 1.0
         deadline = self._wall_clock.now().nanoseconds + int(timeout_sec * 1e9)
         republish_period_sec = 1.0
         next_republish = self._wall_clock.now().nanoseconds
+        stable_since_ns = None
 
         self.publish_initial_pose(x, y, yaw)
         while rclpy.ok() and self._wall_clock.now().nanoseconds < deadline:
             self._spin_once_safe(timeout_sec=0.2)
+            now_ns = self._wall_clock.now().nanoseconds
             if self._cur_pose is not None:
                 cx, cy, _ = self._cur_pose
                 if math.hypot(cx - x, cy - y) <= CONVERGE_TOL_M:
-                    self.get_logger().info(
-                        f'AMCL 재정렬 완료 — 데드레커닝 기준({x:.2f},{y:.2f}) 근방({cx:.2f},{cy:.2f})으로 수렴')
-                    return True
-            now_ns = self._wall_clock.now().nanoseconds
+                    if stable_since_ns is None:
+                        stable_since_ns = now_ns
+                    elif now_ns - stable_since_ns >= int(STABLE_SEC * 1e9):
+                        # [2026-08-25] 여기서 바로 반환해도 여전히 실패가 재현됐다 —
+                        # /amcl_pose 토픽은 이 시점에 이미 맞게 갱신돼 있는데(위에서
+                        # 1초간 안정 확인함), bt_navigator가 실제로 쓰는 map->odom TF는
+                        # 그대로 옛 값이었다(실측: 이 로그 15ms 뒤 "Begin navigating
+                        # from current location"이 여전히 옛 위치). 원인을
+                        # nav2_params.yaml의 amcl.update_min_d/update_min_a(0.05m/rad)
+                        # 에서 찾음 — AMCL은 오도메트리가 이 만큼 움직여야만 다음 스캔을
+                        # 실제로 처리해 파티클필터를 갱신하고 TF를 다시 방송한다.
+                        # /initialpose는 /amcl_pose 토픽엔 즉시 반영되지만 TF 방송은
+                        # 별도 트리거(스캔 처리)가 필요한 것으로 보인다. 이 함수가
+                        # 불리는 시점엔 로봇이 (병목우회 타임아웃 직후라) 정지해 있어서
+                        # 이 이동량 임계값을 저절로 못 넘긴다 — 그래서 여기서 아주 짧게
+                        # 직접 움직여 강제로 넘겨준다(원래 idx==dr_n 정상 전환 경로는
+                        # 이 직후 계속 주행하니 저절로 넘어갔을 것 — 그래서 그 경로에서는
+                        # 이 버그가 안 드러났던 것으로 보임).
+                        nudge_speed = 0.08
+                        nudge = Twist()
+                        nudge.linear.x = nudge_speed
+                        nudge_deadline = self._wall_clock.now().nanoseconds + int(1.0 * 1e9)
+                        while rclpy.ok() and self._wall_clock.now().nanoseconds < nudge_deadline:
+                            self._cmd_vel_pub.publish(nudge)
+                            self._spin_once_safe(timeout_sec=0.1)
+                        self._cmd_vel_pub.publish(Twist())
+                        settle_deadline = self._wall_clock.now().nanoseconds + int(0.5 * 1e9)
+                        while rclpy.ok() and self._wall_clock.now().nanoseconds < settle_deadline:
+                            self._spin_once_safe(timeout_sec=0.1)
+                        self.get_logger().info(
+                            f'AMCL 재정렬 완료 — 데드레커닝 기준({x:.2f},{y:.2f}) 근방({cx:.2f},{cy:.2f})으로 '
+                            f'{STABLE_SEC:.0f}초간 안정적으로 수렴, TF 갱신용 넛지 주행 완료')
+                        return True
+                else:
+                    # 근접해 있다가 다시 벗어남(국소함정으로 되튕김) — 재발행하고
+                    # 안정화 타이머를 리셋한다.
+                    if stable_since_ns is not None:
+                        self.get_logger().warn(
+                            f'AMCL이 재정렬 목표에서 다시 벗어남(현재=({cx:.2f},{cy:.2f})) — '
+                            f'/initialpose 재발행 후 안정화 재시도')
+                        self.publish_initial_pose(x, y, yaw)
+                        next_republish = now_ns + int(republish_period_sec * 1e9)
+                    stable_since_ns = None
             if now_ns >= next_republish:
                 self.publish_initial_pose(x, y, yaw)
                 next_republish = now_ns + int(republish_period_sec * 1e9)
@@ -758,6 +846,17 @@ class ParkingNavigator(Node):
             # 기준으로 "Starting point in lethal space"였다. 지도 조회로 주변
             # 후보들의 clearance를 비교해 가장 여유로운 지점으로 교체.
             (0.90, 4.00),
+            # [2026-08-25 추가] (0.90,4.00)~목표(0,4.2) 구간(0.92m)을 Nav2
+            # SmacPlannerHybrid에 맡겼더니 매번 다른 경로를 골랐는데, 그중 상당수가
+            # x>1.0(클리어런스 0.10~0.20m인 검증 안 된 구역)으로 새서 실패 재현됨
+            # (2026-08-25, parking_zone:=A 여러 회). distance_transform으로 이
+            # 구간을 직접 조회해보니 (0.90,4.00)->목표 직선에 가까운 경로는 클리어런스가
+            # 0.40~0.50m로 계속 넉넉했다 — Nav2가 굳이 안 좋은 쪽으로 새는 이유는
+            # 불명확하나, 검증된 이 직선 경로를 데드레커닝으로 직접 덮어서 Nav2의
+            # 자유 경로선택 자체를 없앤다. 마지막 점은 final_approach_radius(0.6m)
+            # 안쪽이라 도킹(_maybe_start_docking)이 곧바로 이어받는다.
+            (0.70, 4.10),   # clearance 0.412m
+            (0.40, 4.15),   # clearance 0.453m, 목표까지 0.40m(<0.6m, 도킹 트리거)
         ],
     }
     # [2026-08-24] 세그먼트가 전부 짧고(0.20m 간격) 촘촘한 중심선이라, 앞부분 몇 개만
@@ -793,8 +892,18 @@ class ParkingNavigator(Node):
     # 그대로 유지, dr_n 값만 바뀜). 실차/추가 시뮬 미검증 — 그래도 같은 패턴이면
     # 문제는 dr_n이 아니라 idx16 이후 순수 AMCL 자체이거나, 병목 형상 자체의 문제로
     # 봐야 한다.
+    # [2026-08-25] dr_n=16(마지막 웨이포인트 idx16만 순수 AMCL)이었을 때 바로 위 주석이
+    # 예측했던 "같은 패턴이면 idx16 이후 순수 AMCL 자체가 문제"가 실측으로 재현됨:
+    # idx16 진입 시 _resync_amcl_to()로 한 번 재정렬은 되는데, 그 뒤 목표(0.90,4.00)
+    # 0.48m 이내로 못 들어가고 계속 저속 주행하는 동안(최대 corridor_bypass_timeout_sec
+    # 전체) AMCL이 순수 자기 갱신만으로 다시 표류해 핸드오프 시점 위치가 목표와 0.49m
+    # 어긋나 있었다(bt_navigator "Begin navigating from current location (1.39,3.96)"
+    # vs 목표 (0.90,4.00)). 그 어긋난 위치가 실측 클리어런스 0.10~0.20m인 좁은 지점이라
+    # SmacPlannerHybrid가 못 뜨고, 로봇도 그 자리에 물리적으로 낌. 그래서 마지막
+    # 웨이포인트(idx16)까지 전부 데드레커닝으로 덮는다 — 병목구간 전체를 순수 AMCL에
+    # 맡기는 구간 자체를 없앤다.
     ROUTE_BYPASS_DR_COUNT = {
-        ('START', 'A'): 16,
+        ('START', 'A'): 19,  # 2026-08-25: (0.70,4.10)/(0.40,4.15) 추가분 포함 전체
     }
 
     def _run_route_bypass(self, from_leg: str, to_leg: str):
@@ -879,11 +988,29 @@ class ParkingNavigator(Node):
             # 신뢰할 수 있는 데드레커닝 추정치로 AMCL을 강제 재정렬시켜 이 점프를 막는다.
             if idx == dr_n and dr_n > 0:
                 rx, ry, ryaw = self._dr_pose()
-                self._resync_amcl_to(rx, ry, ryaw, timeout_sec=4.0)
+                self._resync_amcl_to(rx, ry, ryaw, timeout_sec=15.0)
             reached = self._drive_corridor_segment(wx, wy, seg_tol, speed_param, deadline, use_dr=use_dr)
             if not reached:
+                # [2026-08-25] 타임아웃이 idx<dr_n(아직 DR 구간, use_dr=True) 중에 나면
+                # 위의 "idx==dr_n에서 AMCL을 DR로 재정렬" 지점을 아예 못 거치고 리턴하게
+                # 된다 — 그러면 AMCL이 국소함정에 빠진 채로 그대로 Nav2에 넘어가서,
+                # bt_navigator가 TF(=AMCL)에서 읽은 "현재 위치"가 실제(DR 추정) 위치와
+                # ~1.5m씩 어긋나 엉뚱한(벽 근처) 셀을 시작점으로 잡고 "Starting point in
+                # lethal space"로 매번 실패하는 걸 실측 확인함(2026-08-25, parking_zone:=A,
+                # 목표=(0.93,2.55)/(0.78,2.15) 등 idx<dr_n 지점에서 타임아웃). 원래
+                # idx==dr_n에서 하려던 재정렬을, 여기서도(늦었더라도) 반드시 한 번 해준다.
+                if use_dr:
+                    rx, ry, ryaw = self._dr_pose()
+                    self._resync_amcl_to(rx, ry, ryaw, timeout_sec=15.0)
                 return  # 타임아웃 — 남은 지점은 건너뛰고 Nav2로 넘어감(기존 정책과 동일)
         self.get_logger().info('병목 구간 통과 완료 — 모든 중심선 웨이포인트 도달')
+        # [2026-08-25] dr_n을 전체 웨이포인트로 늘리면서(위 ROUTE_BYPASS_DR_COUNT 참고)
+        # "idx==dr_n에서 재정렬"이 더 이상 루프 중에 발동하지 않게 됐다 — 마지막
+        # 웨이포인트까지 전부 데드레커닝이라 dr_n에 도달하는 idx 자체가 없기 때문. 그래도
+        # Nav2에 넘기기 직전엔 항상 AMCL이 실제(DR) 위치와 맞아야 하므로, 정상 완주
+        # 시에도 반드시 한 번 재정렬한다.
+        rx, ry, ryaw = self._dr_pose()
+        self._resync_amcl_to(rx, ry, ryaw, timeout_sec=4.0)
 
     def _drive_corridor_segment(self, wx, wy, xy_tol, speed_param, deadline_ns, use_dr=True) -> bool:
         """_run_route_bypass()의 한 웨이포인트 구간을 주행 — 도달하면 True, 공유
@@ -1005,6 +1132,15 @@ class ParkingNavigator(Node):
         전혀 없다 — _docking_control_loop()의 정지감지+전진탈출(후진 없음)이 유일한
         방어선."""
         self.get_logger().info('정밀 접근 반경 진입 — Nav2 목표 취소하고 직접 제어로 전환')
+        # [2026-08-25] 목표 근처에서 AMCL이 두 개의 서로 다른 위치/방향 후보 사이를
+        # 계속 오가는(다중모드) 게 실측 확인됨(예: (0.26,3.56,140°)↔(0.80,3.74,152°)를
+        # 반복 — 물리적으로 그렇게 텔레포트할 수 없으니 명백히 위치추정 오류) — 그 상태로
+        # 도킹 내내 AMCL을 그대로 쓰면 K턴의 dir_sign이 순간적으로 잘못된 헤딩오차 부호에
+        # 고정돼 오히려 헤딩오차가 계속 커지는(136°→173°) 걸 재현 확인함. 도킹 진입
+        # 시점에 데드레커닝 기준점을 새로 잡아서(병목구간 우회와 동일 메커니즘), 이후
+        # 도킹 전체를 순수 적분(오도메트리+IMU) 기반으로 진행한다 — 도킹은 보통 수십 초
+        # 이내로 짧아 누적오차보다 AMCL 다중모드 텔레포트 쪽이 훨씬 위험하다고 판단.
+        self._dr_set_anchor()
         self._docking_active = True
         self._last_direct_linear_x = 0.0
         self._last_direct_cmd_t_ns = None
@@ -1021,7 +1157,7 @@ class ParkingNavigator(Node):
         # 자체는 문제 없었는데 물리적으로 못 움직이고 있었음). 일정 시간 동안 실제
         # 위치 변화가 없으면 "막혔다"로 보고 후진으로 빠져나온다(2026-08-24: 후진
         # 허용 확인됨에 따라 전진전용 탈출에서 원복).
-        self._docking_progress_pose = self._cur_pose
+        self._docking_progress_pose = self._dr_pose()
         self._docking_progress_t = self._wall_clock.now().nanoseconds
         self._docking_backoff_until = None
 
@@ -1038,7 +1174,7 @@ class ParkingNavigator(Node):
         # close_radius(항상 +0.05m 이상 크게 설계됨)이므로 도킹 진입 순간엔 항상 "고정
         # goal_yaw" 조건을 만족한다 — 이 판정을 진입 시점에 굳혀서, 이후 일시적으로
         # 멀어져도 점 추종으로 되돌아가지 않게 한다.
-        cx0, cy0, _ = self._cur_pose
+        cx0, cy0, _ = self._dr_pose()
         gx0, gy0, _ = self._goal_pose
         entry_dist = math.hypot(gx0 - cx0, gy0 - cy0)
         xy_tol = self.get_parameter('docking_xy_tolerance').value
@@ -1051,7 +1187,9 @@ class ParkingNavigator(Node):
         if self._cur_pose is None or self._goal_pose is None:
             return
 
-        cx, cy, cyaw = self._cur_pose
+        # [2026-08-25] AMCL 대신 데드레커닝(_start_docking()에서 앵커 설정) 기준 —
+        # 위 _start_docking() 주석 참고.
+        cx, cy, cyaw = self._dr_pose()
         gx, gy, gyaw = self._goal_pose
         dist = math.hypot(gx - cx, gy - cy)
         xy_tol = self.get_parameter('docking_xy_tolerance').value
@@ -1082,7 +1220,7 @@ class ParkingNavigator(Node):
         px, py, _ = self._docking_progress_pose
         progressed = math.hypot(cx - px, cy - py) >= STUCK_MOVE_M
         if progressed:
-            self._docking_progress_pose = self._cur_pose
+            self._docking_progress_pose = (cx, cy, cyaw)
             self._docking_progress_t = now_ns
         elif self._docking_backoff_until is None and \
                 (now_ns - self._docking_progress_t) / 1e9 >= STUCK_TIMEOUT_SEC:
@@ -1141,6 +1279,11 @@ class ParkingNavigator(Node):
         # 다시 전진 원호 제어로 전환한다(_docking_arc_control 내부 분기 참고).
         cmd = self._docking_arc_control(heading_err, dist)
         self._cmd_vel_pub.publish(cmd)
+        self.get_logger().info(
+            f'[진단-도킹cmd] k_turn={self._docking_k_turn_active} '
+            f'linear={cmd.linear.x:.3f} angular={cmd.angular.z:.3f} '
+            f'front_clear={self._lidar_front_clearance(1.0 if cmd.linear.x >= 0 else -1.0):.3f}',
+            throttle_duration_sec=1.0)
 
     def _ramp_linear_speed(self, target_speed, max_accel=0.3):
         """직접제어(도킹/병목우회) 공용 속도 램프. [2026-08-22] 목표속도를 한 틱에
@@ -1210,14 +1353,43 @@ class ParkingNavigator(Node):
         return self._docking_forward_arc_control(heading_err, dist)
 
     def _docking_k_turn_control(self):
-        """K턴 한 phase를 실행 — dir_sign(조향 방향)은 K턴 진입 시 1회 고정되고
-        (_docking_arc_control 참고), phase_direction(+1=전진/-1=후진)만 K_TURN_PHASE_SEC
-        마다 뒤집힌다. 전진 phase에는 dir_sign 쪽으로, 후진 phase에는 그 반대쪽으로
-        조향해야 두 phase가 서로 상쇄되지 않고 같은 방향 회전이 누적된다 — 실제 K턴
-        주차(예: 전진-좌 다음 후진-우를 해야 좌회전이 쌓인다)와 동일한 원리."""
-        K_TURN_PHASE_SEC = 1.0
+        """K턴 한 phase를 실행 — dir_sign(회전각속도 목표 부호)은 K턴 진입 시 1회
+        고정되고(_docking_arc_control 참고), phase_direction(+1=전진/-1=후진)만
+        K_TURN_PHASE_SEC마다 뒤집힌다.
+
+        [2026-08-25 정정] 원래 여기서 phase_direction에 따라 steer_sign(=angular_z의
+        부호)을 전진/후진마다 반대로 뒤집었다 — "실제 수동 K턴처럼 전진-좌 다음
+        후진-우로 조향해야 같은 방향 회전이 누적된다"는 논리였는데, 이건 "조향휠
+        각도" 기준 직관이지 이 코드가 실제로 보내는 /cmd_vel의 angular_z(목표
+        yaw rate, ω) 기준이 아니다. cmd_vel_bridge.py의 변환식(steer =
+        atan2(sign(v)*angular_z*L, |v|))이 이미 v(전진/후진)에 따라 조향각 부호를
+        자동으로 보정해서, **같은 angular_z를 유지하면 전진이든 후진이든 항상 같은
+        방향(같은 부호)으로 회전**하도록 설계돼 있다(그 파일 12~22행 주석 참고).
+        즉 여기서 phase마다 angular_z 부호를 또 뒤집으면 이중 반전이 되어 두
+        phase가 회전을 상쇄시킨다 — 실측 확인(2026-08-25): 헤딩오차가 60초 동안
+        초당 0.3~1.5도밖에 안 줄어듦(정상이면 초당 수십 도는 나와야 함). dir_sign을
+        전진/후진 공통으로 고정해서(더 이상 phase마다 안 뒤집음) 두 phase가 같은
+        방향 회전을 누적하도록 고친다."""
+        # [2026-08-25] 1.0초 -> 0.35초로 축소. 헤딩은 잘 수렴하는데(수정 완료, 위 참고)
+        # 그 대신 위치가 계속 밀리는 게 실측 확인됨(60~150초 K턴 동안 최대 2.34m
+        # 이탈) — phase가 길수록(=한 번에 크게 스윙할수록) 사이클마다 순변위가 커지는
+        # 것으로 추정, 회전 속도(각속도) 자체는 phase 길이와 무관하게 유지되므로
+        # phase를 짧게 쪼개면 같은 총 회전량을 훨씬 잘게 나눠 스윙하게 돼 순변위가
+        # 줄어들 것으로 기대.
+        K_TURN_PHASE_SEC = 0.35
         K_TURN_SPEED = 0.15
-        MIN_SAFE_RADIUS_M = 0.25
+        # [2026-08-25] 0.25m -> 0.12m. phase를 짧게 쪼갠 것만으로는 부족했다 —
+        # docking_timeout_sec을 150->250초로 늘렸더니 오히려 이탈거리가 더 커짐
+        # (1.02m -> 1.79m, 시간을 더 줄수록 계속 밀려남) — 이건 "시간 부족"이
+        # 아니라 "phase 하나당 회전량 대비 순변위 비율" 자체가 안 좋다는 뜻이다.
+        # 회전반경(=K_TURN_SPEED/max_angular)을 줄이면 같은 속도에서 각속도가
+        # 커져 ①총 소요시간이 줄고 ②원호 하나당 이동거리 대비 회전량 비율도
+        # 커져서(더 제자리회전에 가까워짐) 순변위가 줄 것으로 기대. 차량 실제
+        # 최소회전반경은 0.06m(README §1, 최대조향각 80도 기준)이므로 0.12m는
+        # 그 2배 여유를 둔 값 — _docking_forward_arc_control의 0.25m(차체가
+        # 넓게 쓸고 지나가는 걸 막기 위한 값)보다는 좁지만, K턴은 저속(0.15m/s)
+        # 전용이라 그 근거가 그대로 적용되진 않는다.
+        MIN_SAFE_RADIUS_M = 0.12
 
         now_ns = self._wall_clock.now().nanoseconds
         if (self._docking_k_turn_phase_deadline_ns is None
@@ -1226,15 +1398,21 @@ class ParkingNavigator(Node):
             self._docking_k_turn_phase_deadline_ns = now_ns + int(K_TURN_PHASE_SEC * 1e9)
 
         direction = self._docking_k_turn_phase_direction
-        steer_sign = (self._docking_k_turn_dir_sign if direction > 0
-                      else -self._docking_k_turn_dir_sign)
+        steer_sign = self._docking_k_turn_dir_sign  # 전진/후진 공통(더 이상 반전 안 함)
 
-        target_speed = direction * self._front_safety_speed_cap(K_TURN_SPEED, direction)
+        target_speed = direction * self._front_safety_speed_cap(K_TURN_SPEED, direction, docking=True)
         speed = self._ramp_linear_speed(target_speed)
 
         max_angular = K_TURN_SPEED / MIN_SAFE_RADIUS_M
         angular_z = steer_sign * max_angular
-        angular_z += self._lidar_steer_bias(direction)
+        # [2026-08-25] _lidar_steer_bias(장애물 있는 쪽 반대로 미는 바이어스, gain=3.0
+        # — 병목 통로 중앙유지용으로 설계됨)를 K턴에서 빼낸다. 실측 확인: 목표 근처
+        # (벽까지 0.3~0.5m)에서는 거의 항상 가까운 장애물이 잡혀서 이 바이어스가
+        # 수시로 켜지는데, 그 크기가 base 조향(0.6 rad/s)보다 커서 K턴의 의도된
+        # 회전 방향을 자주 뒤집어버렸다(angular_z 로그에 -0.4~-0.8 같은 반대부호가
+        # 섞여 나옴, 2026-08-25). K턴은 "의도적으로 정해진 방향으로 크게 회전"하는
+        # 동작이라 이런 미세 회피 바이어스와 상성이 안 맞는다 — 벽 접촉 자체는
+        # _docking_control_loop의 정지감지+후진탈출이 별도로 막는다.
         angular_z = self._ramp_angular_speed(angular_z)
 
         cmd = Twist()
@@ -1251,7 +1429,7 @@ class ParkingNavigator(Node):
         kp = self.get_parameter('docking_yaw_kp').value
         approach_speed = self.get_parameter('final_approach_speed').value
         speed = max(approach_speed * 0.4, min(approach_speed, dist * 0.6))
-        speed = self._front_safety_speed_cap(speed, direction)
+        speed = self._front_safety_speed_cap(speed, direction, docking=True)
         speed = self._ramp_linear_speed(speed)
 
         # [2026-08-20] kp*steer_err가 크면(헤딩오차가 클수록) 회전반경이 차체
@@ -1320,16 +1498,25 @@ class ParkingNavigator(Node):
             self.get_logger().warn(f'spin_once 일시 오류(무시하고 계속): {e}', throttle_duration_sec=2.0)
 
     def run(self):
-        """미션 전체를 레그 순서대로 수행한다(2026-08-24 재작성). 기본값('FULL')이면
-        MISSION_LEGS(출발→A→B→출발복귀)를 전부 순회하고, parking_zone 파라미터로
-        개별 레그 이름(예: 'A')을 주면 그 레그 하나만 실행한다(디버깅용, 기존 단일
-        레그 동작과 동일).
+        """미션 전체를 레그 순서대로 수행한다. [2026-08-25 정정] 실제 대회 미션은
+        "출발 → 목표 자리(A 또는 B, 라운드마다 대회 측이 배정) → 출발지 복귀" 단
+        하나의 자리만 방문한다 — A/B 둘 다 방문하는 게 아니다(이전 버전의 §3 다중
+        레그 서술은 잘못된 전제였음, 사용자 확인). 그래서 parking_zone이 'A'나 'B'면
+        [해당 레그, 'START']를 수행한다(목표 자리 → 복귀까지 자동 포함).
+        'START'만 주면 복귀 레그 하나만(디버깅용). 'FULL'이면 MISSION_LEGS(출발→A→B→
+        출발복귀) 전부를 도는데, 이건 실제 대회 동작이 아니라 내부 회귀테스트용으로만
+        남겨둔 것(두 목표 자리에 대한 경로/도킹 튜닝을 한 번에 검증하려는 목적).
 
         레그 하나가 실패(타임아웃/거부)해도 다음 레그로 계속 진행한다 — 경기 규정상
-        한 구역을 놓쳤다고 나머지를 포기하는 것보다 남은 구역이라도 시도하는 쪽이
-        유리하다(부분 감점 vs 전체 포기)."""
+        목표 자리에 실패했어도 출발지 복귀는 시도하는 쪽이 유리하다(출발지 정차
+        실패는 별도 감점 항목이라 복귀라도 해야 손해를 줄인다)."""
         zone_param = self.get_parameter('parking_zone').value.upper()
-        legs = self.MISSION_LEGS if zone_param == 'FULL' else [zone_param]
+        if zone_param == 'FULL':
+            legs = self.MISSION_LEGS
+        elif zone_param in ('A', 'B'):
+            legs = [zone_param, 'START']
+        else:  # 'START' 단독 등 — 해당 레그 하나만(디버깅용)
+            legs = [zone_param]
 
         if self.get_parameter('set_initial_pose').value:
             wait_sec = self.get_parameter('initial_pose_wait_sec').value
@@ -1359,8 +1546,30 @@ class ParkingNavigator(Node):
             # 통과시킨다(위 ROUTE_BYPASS_CENTERLINE 참고, 없으면 즉시 반환).
             self._run_route_bypass(prev_leg, leg)
 
-            self._retry_count = 0
-            self.send_goal(leg)
+            # [2026-08-25] 병목우회 마지막 웨이포인트를 목표 바로 앞(도킹 트리거
+            # 반경 안)까지 연장했는데도, Nav2에 목표를 보내면 SmacPlannerHybrid가
+            # 매번 검증 안 된(클리어런스 0.10~0.20m) 쪽으로 새는 게 반복 재현됨
+            # (2026-08-25, parking_zone:=A) — 이미 도킹 반경 안이라면 Nav2에 아예
+            # 안 넘기고 곧바로 정밀 접근(도킹)으로 전환해서 이 자유 경로선택 구간
+            # 자체를 없앤다.
+            rx, ry, ryaw = self._dr_pose()
+            gx, gy, gyaw = self._leg_pose(leg)
+            dr_dist_to_goal = math.hypot(gx - rx, gy - ry)
+            radius = self.get_parameter('final_approach_radius').value
+            if dr_dist_to_goal <= radius:
+                self.get_logger().info(
+                    f"병목우회 완주 지점이 이미 도킹 반경 안(남은거리={dr_dist_to_goal:.2f}m"
+                    f"<={radius:.2f}m) — Nav2 생략하고 곧바로 정밀 접근 전환")
+                self._current_leg = leg.upper()
+                self._leg_done = False
+                self._leg_success = False
+                self._docking_active = False
+                self._goal_pose = (gx, gy, gyaw)
+                self._goal_handle = None
+                self._start_docking()
+            else:
+                self._retry_count = 0
+                self.send_goal(leg)
 
             while rclpy.ok() and not self._leg_done:
                 if self._wall_clock.now().nanoseconds >= mission_deadline_ns:
@@ -1377,6 +1586,17 @@ class ParkingNavigator(Node):
                     self._leg_success = False
                     break
                 self._spin_once_safe(timeout_sec=0.2)
+                # [2026-08-25 디버깅용] 최종 접근 단계에서 원인불명 lethal-space
+                # 정체가 재현되고 있어, Nav2가 직접 주행하는 구간(병목우회 이후) 동안
+                # AMCL 추정이 갑자기 튀는지(또 다른 국소함정) 확인하려고 추가.
+                if self._cur_pose is not None:
+                    cx, cy, cyaw = self._cur_pose
+                    dx, dy, dyaw = self._dr_pose()
+                    self.get_logger().info(
+                        f'[진단-최종접근] AMCL=({cx:.2f},{cy:.2f},{math.degrees(cyaw):.0f}deg) '
+                        f'DR=({dx:.2f},{dy:.2f},{math.degrees(dyaw):.0f}deg) '
+                        f'docking={self._docking_active}',
+                        throttle_duration_sec=1.0)
 
             leg_results[leg] = self._leg_success
             self.get_logger().info(

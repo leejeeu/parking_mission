@@ -71,8 +71,11 @@ def generate_launch_description():
         'urdf', default_value=default_urdf,
         description='스폰할 차량 URDF')
     declare_parking_zone_arg = DeclareLaunchArgument(
-        'parking_zone', default_value='A',
-        description="목표 주차영역: 'A' 또는 'B' (parking_mission.launch.py로 그대로 전달)")
+        'parking_zone', default_value='FULL',
+        description="'A' 또는 'B'(대회에서 배정된 목표 자리) - 해당 레그+출발복귀까지 "
+                    "자동 수행. 'START'는 복귀 레그만(디버깅용). 'FULL'(기본값)은 실제 "
+                    "대회 동작 아님, A/B 양쪽 다 도는 내부 회귀테스트용 "
+                    "(parking_mission.launch.py로 그대로 전달)")
     declare_start_x_arg = DeclareLaunchArgument(
         'start_x', default_value=str(rx),
         description='스폰 시작 x(random_start:=true면 무작위 선택된 값 — parking_navigator.py로 그대로 전달됨)')

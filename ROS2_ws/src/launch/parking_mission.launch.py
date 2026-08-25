@@ -47,14 +47,16 @@ def generate_launch_description():
         'autostart', default_value='true',
         description='Nav2 lifecycle 노드 자동 활성화 여부')
 
-    # [2026-08-24] 공식 경기 규정 확인 결과 이 미션은 "출발 → A 주차 → B 주차 →
-    # 출발지 복귀"를 한 번에 전부 수행해야 한다 — 기본값을 'FULL'로 바꿔 그 전체
-    # 시퀀스가 기본 동작이 되도록 함. 'A'/'B'처럼 개별 레그 이름을 주면 그 레그
-    # 하나만 실행한다(디버깅/개별 구간 튜닝용, 기존 단일 레그 동작과 동일).
+    # [2026-08-25 정정] 실제 대회 미션은 "출발 → 목표 자리(A 또는 B, 라운드마다 배정) →
+    # 출발지 복귀"이다 — A/B 둘 다 방문하는 게 아님(2026-08-24 버전의 전제가 틀렸었음,
+    # 사용자 확인). 그래서 'A' 또는 'B'를 주면 해당 레그+복귀까지 자동 수행한다.
+    # 'FULL'은 실제 대회 동작이 아니라 A/B 양쪽 경로를 한 번에 회귀테스트하는 용도로만
+    # 남겨둠. 실행 시 반드시 그 라운드에 배정된 값(parking_zone:=A 또는 :=B)을 명시할 것.
     declare_parking_zone_arg = DeclareLaunchArgument(
         'parking_zone', default_value='FULL',
-        description="'FULL'(기본값)이면 출발→A→B→출발복귀 전체 순회, "
-                     "'A'/'B'/'START'를 주면 그 레그 하나만 실행(디버깅용)")
+        description="'A' 또는 'B'(대회에서 배정된 목표 자리) — 해당 레그+출발복귀까지 "
+                     "자동 수행. 'START'는 복귀 레그만(디버깅용). 'FULL'(기본값)은 "
+                     "실제 대회 동작 아님, A/B 양쪽 다 도는 내부 회귀테스트용")
 
     declare_set_initial_pose_arg = DeclareLaunchArgument(
         'set_initial_pose', default_value='true',

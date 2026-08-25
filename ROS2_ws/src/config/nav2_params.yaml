@@ -320,19 +320,24 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_link
-      # [2026-08-20] robot_radius(원형 근사, 0.36m) -> 실제 사각형 footprint로 교체.
-      # local_costmap(RegulatedPurePursuit가 씀)은 회귀 이력 때문에 원형을 그대로
-      # 두지만, global_costmap은 SmacPlannerHybrid(위 planner_server.GridBased)의
-      # 계획 단계 충돌검사에만 쓰이고 RPP의 스윕 로직과 무관하므로 여기만 바꾼다.
-      # 치수: VEHICLE_LENGTH_M=0.64, VEHICLE_WIDTH_M=0.31(vehicle_spec.py), base_link
-      # 원점=차량 중심(urdf/xycar.urdf 주석과 동일 전제) -> 반장/반폭 0.32/0.155.
-      # [2026-08-20 추가] 실치수 그대로(마진 0)로 먼저 돌려봤더니 AMCL/경로추종 오차
-      # 때문에 실제로 벽과 접촉하는 걸 실측 확인함(로봇 현재위치가 지도 occupied
-      # 픽셀과 정확히 겹침, clearance=0.0m). 마진 0.04m로 올렸다가도 다른 지점(벽까지
-      # 여유 0.22m인 통로)에서 또 접촉 확인(2026-08-20) — 0.04m로는 부족해서 0.07m로
-      # 올린다(트랙 프로젝트 hybrid_astar.py의 ASTAR_VEHICLE_MARGIN_M과 같은 설계 —
-      # 실측 풋프린트 + 명시적 여유). 그래도 원형 근사(0.36m)보다는 작아 통로 통과
-      # 능력은 유지되길 기대.
+      # [2026-08-25] 한때 이 자리를 robot_radius(0.36, 원형)로 되돌렸었다("사각형이
+      # SmacPlannerHybrid의 폴리곤 충돌검사에서 대각선(~0.45m)까지 걸린다"는 이론
+      # 때문) — 그런데 되돌린 뒤에도 "Starting point in lethal space"가 그대로
+      # 재현됐고, `parking_map.pgm`을 distance-transform으로 직접 분석해보니 이
+      # 병목 통로(y≈2.55~3.75 구간)는 최선의 x를 골라도 여유가 0.30~0.53m밖에 안 돼서,
+      # 원형 robot_radius=0.36m 요구치(전 방향으로 0.36m 확보)조차 일부 구간(예:
+      # y=3.75, 최선의 x에서도 0.35m)에서 물리적으로 못 채운다는 걸 확인했다 — 즉
+      # 원형 모델은 이 통로에서 애초에 성립 불가능. 반대로 실제 차량 폭(0.31m,
+      # vehicle_spec.py)에 맞춘 사각형(반폭 0.225m)은 이 통로가 어디서든 여유롭게
+      # 통과 가능(0.30m 이상은 반폭 0.225m보다 크다) — 즉 사각형 자체는 이 좁은
+      # 통로를 실제로 통과하기 위한 올바른 방향이었다. 그래서 사각형으로 다시
+      # 되돌리고, 대신 실제 실패 원인이었던 AMCL 핸드오프 타이밍 버그를
+      # parking_navigator.py의 _run_route_bypass()에서 고쳤다(타임아웃으로 병목우회가
+      # 끝날 때도 AMCL을 데드레커닝 기준으로 강제 재정렬하도록) — 자세한 내용은 그
+      # 커밋의 주석 참고. 치수: VEHICLE_LENGTH_M=0.64, VEHICLE_WIDTH_M=0.31
+      # (vehicle_spec.py), base_link 원점=차량 중심 -> 반장/반폭 0.32/0.155,
+      # 실측 접촉 이력(2026-08-20, clearance=0.0~0.22m에서 접촉 확인) 때문에 마진
+      # 0.07m를 더해 0.39/0.225로 운용.
       footprint: "[[0.39, 0.225], [0.39, -0.225], [-0.39, -0.225], [-0.39, 0.225]]"
       resolution: 0.05
       track_unknown_space: true
@@ -356,21 +361,14 @@ global_costmap:
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # [2026-08-22] 위 inflation_radius=0.1 제약(과 그 근거였던 robot_radius=0.36
-        # 계산)은 전부 local_costmap의 "원형 근사(robot_radius)" 기준이다 — 이 global
-        # costmap은 아래 footprint(사각형, [[0.39,0.225]...])를 쓰므로 실제 inscribed
-        # radius는 min(0.39,0.225)=0.225m로 local_costmap의 robot_radius(0.36m)보다
-        # 훨씬 작다. "목표(벽에서 0.5m)가 통행불가가 된다"는 제약은 inscribed radius
-        # 기준(0.225+inflation_radius<0.5 => inflation_radius<0.275)이지 robot_radius
-        # 기준이 아니므로, 이 global costmap만은 0.25까지 늘려도 목표 도달가능성이
-        # 깨지지 않는다(local_costmap의 0.1은 그대로 둠 — 거긴 진짜 robot_radius=0.36
-        # 기준이라 위 제약이 유효함). 실측 확인: 폭 0.1로는 중앙 기둥과 왼쪽 벽 사이
-        # 폭 0.7m대 통로에서 경로가 기둥 쪽에 거의 붙어(클리어런스 0.10~0.11m)
-        # "Starting point in lethal space"로 막힘 — parking_map.pgm 거리변환으로 그
-        # 통로 자체는 중앙(클리어런스 0.40m 지점)으로 가면 충분히 넓다는 걸 확인했으므로,
-        # 물리적 병목이 아니라 "중앙으로 붙일 유인 부족"이 원인이라고 판단했다.
+        # 사각형 footprint(위 참고) 기준 inscribed radius=min(0.39,0.225)=0.225m로
+        # local_costmap의 원형 robot_radius(0.36m)보다 작다 — "목표(벽에서 0.5m)가
+        # 통행불가가 된다"는 제약이 inscribed radius 기준(0.225+inflation_radius<0.5
+        # => inflation_radius<0.275)이 되므로 0.25까지 늘려도 목표 도달가능성이 깨지지
+        # 않는다(2026-08-22 실측 근거 — local_costmap의 0.1은 원형 robot_radius=0.36
+        # 기준이라 그대로 둠). 폭 0.1로는 병목 통로에서 경로가 한쪽에 붙어(클리어런스
+        # 0.10~0.11m) lethal-space로 막히는 걸 실측 확인했었다.
         cost_scaling_factor: 8.0
-        # 0.1 -> 0.25(위 주석 근거: 이 costmap은 footprint 기반이라 0.275까지 여유 있음).
         inflation_radius: 0.25
       always_send_full_costmap: true
 
