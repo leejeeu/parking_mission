@@ -47,14 +47,12 @@ def generate_launch_description():
         'autostart', default_value='true',
         description='Nav2 lifecycle 노드 자동 활성화 여부')
 
-    # [2026-08-24] 공식 경기 규정 확인 결과 이 미션은 "출발 → A 주차 → B 주차 →
-    # 출발지 복귀"를 한 번에 전부 수행해야 한다 — 기본값을 'FULL'로 바꿔 그 전체
-    # 시퀀스가 기본 동작이 되도록 함. 'A'/'B'처럼 개별 레그 이름을 주면 그 레그
-    # 하나만 실행한다(디버깅/개별 구간 튜닝용, 기존 단일 레그 동작과 동일).
+    # [2026-08-25 정정] 실제 미션은 A/B 둘 중 실행 전 지정된 한 구역만 방문 후
+    # 출발지로 복귀한다(두 구역을 동시에 가지 않음). 어느 구역인지는 센서 자동판단
+    # 없이 실행 전 사람이 이 인자로 지정한다 — 'A' 또는 'B' 필수.
     declare_parking_zone_arg = DeclareLaunchArgument(
-        'parking_zone', default_value='FULL',
-        description="'FULL'(기본값)이면 출발→A→B→출발복귀 전체 순회, "
-                     "'A'/'B'/'START'를 주면 그 레그 하나만 실행(디버깅용)")
+        'parking_zone', default_value='A',
+        description="주차할 구역 — 'A' 또는 'B' (필수 선택, 해당 구역 방문 후 출발지 복귀)")
 
     declare_set_initial_pose_arg = DeclareLaunchArgument(
         'set_initial_pose', default_value='true',

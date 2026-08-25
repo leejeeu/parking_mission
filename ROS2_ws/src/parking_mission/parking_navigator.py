@@ -65,12 +65,12 @@ class ParkingNavigator(Node):
         # 전체와 시간대를 맞춰야 하는 곳에만 남겨둔다.
         self._wall_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
 
-        # [2026-08-24] 공식 경기 규정 확인 결과 이 미션은 "출발 → A 주차 → B 주차 →
-        # 출발지 복귀"를 전부 한 번에 수행해야 한다(과거엔 A 또는 B 중 하나에만 가고
-        # 끝나는 것으로 잘못 구현돼 있었음). 'FULL'(기본값)이면 MISSION_LEGS 전체를
-        # 순서대로 수행하고, 'A'/'B'처럼 개별 레그 이름을 주면 그 레그 하나만 실행한다
-        # (기존 단일 레그 동작 — 디버깅/개별 구간 튜닝용으로 유지).
-        self.declare_parameter('parking_zone', 'FULL')
+        # [2026-08-25 정정] 이전(2026-08-24) 메모가 "출발→A→B→출발복귀 전부 순회"를
+        # 공식 규정이라 적었는데 잘못된 이해였다 — 실제 미션은 A/B 둘 중 실행 전에
+        # 지정된 한 구역만 방문 후 출발지로 복귀한다(동시에 두 구역을 다 가지 않음).
+        # 어느 구역인지는 센서로 자동판단하지 않고 실행 전 사람이 parking_zone 파라미터로
+        # 지정한다 — 'A' 또는 'B' 필수.
+        self.declare_parameter('parking_zone', 'A')
         self.declare_parameter('goal_frame_id', 'map')
         self.declare_parameter('set_initial_pose', True)
         # /initialpose 구독자 연결을 기다리는 최대 시간이면서, 동시에 AMCL이 그 초기
@@ -291,9 +291,6 @@ class ParkingNavigator(Node):
         y = self.get_parameter(f'{prefix}_y').value
         yaw = self.get_parameter(f'{prefix}_yaw').value
         return x, y, yaw
-
-    # 미션 레그 고정 순서 — 공식 맵 안내문 기준("출발 → A 주차 → B 주차 → 출발지 복귀").
-    MISSION_LEGS = ['A', 'B', 'START']
 
     def _leg_pose(self, leg: str):
         """레그 이름('A'/'B'/'START')에 대응하는 목표 pose. 'START'는 출발지 복귀용으로
@@ -1269,16 +1266,13 @@ class ParkingNavigator(Node):
             self.get_logger().warn(f'spin_once 일시 오류(무시하고 계속): {e}', throttle_duration_sec=2.0)
 
     def run(self):
-        """미션 전체를 레그 순서대로 수행한다(2026-08-24 재작성). 기본값('FULL')이면
-        MISSION_LEGS(출발→A→B→출발복귀)를 전부 순회하고, parking_zone 파라미터로
-        개별 레그 이름(예: 'A')을 주면 그 레그 하나만 실행한다(디버깅용, 기존 단일
-        레그 동작과 동일).
-
-        레그 하나가 실패(타임아웃/거부)해도 다음 레그로 계속 진행한다 — 경기 규정상
-        한 구역을 놓쳤다고 나머지를 포기하는 것보다 남은 구역이라도 시도하는 쪽이
-        유리하다(부분 감점 vs 전체 포기)."""
+        """[2026-08-25] parking_zone 파라미터('A' 또는 'B')로 지정된 구역 하나만
+        방문한 뒤 출발지로 복귀한다 — 두 구역을 동시에 방문하지 않는다."""
         zone_param = self.get_parameter('parking_zone').value.upper()
-        legs = self.MISSION_LEGS if zone_param == 'FULL' else [zone_param]
+        if zone_param not in ('A', 'B'):
+            raise ValueError(
+                f"parking_zone은 'A' 또는 'B'여야 함 (현재: '{zone_param}')")
+        legs = [zone_param, 'START']
 
         if self.get_parameter('set_initial_pose').value:
             wait_sec = self.get_parameter('initial_pose_wait_sec').value
